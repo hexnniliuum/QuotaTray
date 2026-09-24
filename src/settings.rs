@@ -1,9 +1,10 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use crate::model::Provider;
+use crate::palette::{Rgb, UsageColors};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Source {
@@ -78,9 +79,19 @@ pub fn default_directory(provider: Provider) -> &'static str {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub providers: [ProviderSettings; Provider::COUNT],
+    pub colors: [UsageColors; Provider::COUNT],
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            providers: std::array::from_fn(|_| ProviderSettings::default()),
+            colors: Provider::ALL.map(UsageColors::for_provider),
+        }
+    }
 }
 
 impl Settings {
@@ -88,22 +99,21 @@ impl Settings {
         match fs::read_to_string(settings_path()?) {
             Ok(content) => Self::parse(&content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(_) => {
-                Err("Cannot read sources.json. Open Sources > Edit advanced settings.".into())
-            }
+            Err(_) => Err("Cannot read config.json. Open Sources > Edit advanced settings.".into()),
         }
     }
 
     fn parse(content: &str) -> Result<Self, String> {
         let invalid =
-            || "Invalid sources.json. Check the source names and absolute paths.".to_string();
+            || "Invalid config.json. Check the source names and absolute paths.".to_string();
         let root: Value =
             serde_json::from_str(content.trim_start_matches('\u{feff}')).map_err(|_| invalid())?;
         let object = root.as_object().ok_or_else(invalid)?;
-        if object
-            .keys()
-            .any(|key| Provider::ALL.iter().all(|provider| provider.key() != key.as_str()))
-        {
+        if object.keys().any(|key| {
+            Provider::ALL
+                .iter()
+                .all(|provider| provider.key() != key.as_str())
+        }) {
             return Err(invalid());
         }
         let mut settings = Self::default();
@@ -113,8 +123,14 @@ impl Settings {
             };
             let fields = value.as_object().ok_or_else(invalid)?;
             if fields.keys().any(|key| {
-                !["source", "distro", "windows_config_dir", "wsl_config_dir"]
-                    .contains(&key.as_str())
+                ![
+                    "source",
+                    "distro",
+                    "windows_config_dir",
+                    "wsl_config_dir",
+                    "colors",
+                ]
+                .contains(&key.as_str())
             }) {
                 return Err(invalid());
             }
@@ -155,32 +171,96 @@ impl Settings {
                 return Err(invalid());
             }
             settings.providers[provider.index()] = config;
+            if let Some(value) = fields.get("colors").filter(|value| !value.is_null()) {
+                let invalid_color = || {
+                    format!(
+                        "Invalid config.json: {}.colors must contain normal or warning colors in #RRGGBB format.",
+                        provider.key()
+                    )
+                };
+                let colors = value.as_object().ok_or_else(invalid_color)?;
+                if colors
+                    .keys()
+                    .any(|key| !["normal", "warning"].contains(&key.as_str()))
+                {
+                    return Err(invalid_color());
+                }
+                let target = &mut settings.colors[provider.index()];
+                for (key, color) in [
+                    ("normal", &mut target.normal),
+                    ("warning", &mut target.warning),
+                ] {
+                    if let Some(value) = colors.get(key).filter(|value| !value.is_null()) {
+                        *color = value
+                            .as_str()
+                            .and_then(parse_color)
+                            .ok_or_else(invalid_color)?;
+                    }
+                }
+            }
         }
         Ok(settings)
     }
 
     pub fn save(&self) -> Result<(), String> {
         let path = settings_path()?;
+        fs::create_dir_all(path.parent().unwrap())
+            .and_then(|_| fs::write(path, serde_json::to_string_pretty(&self.to_json()).unwrap()))
+            .map_err(|_| "Could not save config.json.".to_string())
+    }
+
+    fn to_json(&self) -> Value {
         let mut root = json!({});
         for provider in Provider::ALL {
             let config = &self.providers[provider.index()];
+            let colors = self.colors[provider.index()];
             root[provider.key()] = json!({
                 "source": config.source.key(),
                 "distro": config.distro,
                 "windows_config_dir": config.windows_config_dir,
                 "wsl_config_dir": config.wsl_config_dir,
+                "colors": {
+                    "normal": format_color(colors.normal),
+                    "warning": format_color(colors.warning),
+                },
             });
         }
-        fs::create_dir_all(path.parent().unwrap())
-            .and_then(|_| fs::write(path, serde_json::to_string_pretty(&root).unwrap()))
-            .map_err(|_| "Could not save sources.json.".to_string())
+        root
     }
 }
 
+fn parse_color(value: &str) -> Option<Rgb> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    Some(Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+}
+
+fn format_color(Rgb(red, green, blue): Rgb) -> String {
+    format!("#{red:02X}{green:02X}{blue:02X}")
+}
+
 pub fn settings_path() -> Result<PathBuf, String> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|root| PathBuf::from(root).join("QuotaTray").join("sources.json"))
-        .ok_or_else(|| "LOCALAPPDATA was not found.".to_string())
+    let root = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "LOCALAPPDATA was not found.".to_string())?;
+    config_path(&PathBuf::from(root).join("QuotaTray"))
+}
+
+fn config_path(directory: &Path) -> Result<PathBuf, String> {
+    let path = directory.join("config.json");
+    let legacy = directory.join("sources.json");
+    let migrate = || -> std::io::Result<()> {
+        if !path.try_exists()? && legacy.try_exists()? {
+            fs::rename(&legacy, &path)?;
+        }
+        Ok(())
+    };
+    migrate().map_err(|_| {
+        "Cannot access config.json or migrate sources.json. Check the QuotaTray settings folder.".to_string()
+    })?;
+    Ok(path)
 }
 
 // Auto retries the complete read, including authentication, in the next environment.
@@ -202,6 +282,39 @@ pub fn try_sources<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_path_migrates_legacy_settings_without_overwriting_new_settings() {
+        let directory = std::env::temp_dir().join(format!(
+            "quota-tray-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.json");
+        let legacy = directory.join("sources.json");
+        assert_eq!(config_path(&directory).unwrap(), path);
+        assert!(!path.exists());
+        let original = r##"{"claude":{"source":"wsl","colors":{"normal":"#123456"}}}"##;
+        fs::write(&legacy, original).unwrap();
+        assert_eq!(config_path(&directory).unwrap(), path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!legacy.exists());
+        let settings = Settings::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(settings.providers[0].source, Source::Wsl);
+        assert_eq!(settings.colors[0].normal, Rgb(18, 52, 86));
+        fs::write(&legacy, "legacy file must not replace config").unwrap();
+        assert_eq!(config_path(&directory).unwrap(), path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(legacy.exists());
+        fs::write(&path, "invalid config must not fall back to legacy").unwrap();
+        assert_eq!(config_path(&directory).unwrap(), path);
+        assert!(Settings::parse(&fs::read_to_string(&path).unwrap()).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn explicit_source_never_uses_another_account() {
@@ -248,5 +361,54 @@ mod tests {
         assert_eq!(settings.providers[1].source, Source::Wsl);
         assert_eq!(settings.providers[1].distro.as_deref(), Some("Ubuntu"));
         assert_eq!(settings.providers[0], ProviderSettings::default());
+    }
+
+    #[test]
+    fn missing_colors_use_defaults_and_partial_overrides_keep_other_defaults() {
+        let defaults = Settings::default();
+        assert_eq!(Settings::parse("{}").unwrap().colors, defaults.colors);
+        let settings = Settings::parse(
+            r##"{"claude":{"colors":{"normal":"#12aB34"}},"codex":{"colors":{"warning":"#56789a"}}}"##,
+        ).unwrap();
+        assert_eq!(settings.colors[0].at(75.0), Rgb(18, 171, 52));
+        assert_eq!(settings.colors[0].at(80.0), defaults.colors[0].warning);
+        assert_eq!(settings.colors[1].at(79.9), defaults.colors[1].normal);
+        assert_eq!(settings.colors[1].at(80.0), Rgb(86, 120, 154));
+        let cleared = Settings::parse(
+            r#"{"claude":{"colors":null},"codex":{"colors":{"normal":null,"warning":null}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.colors, defaults.colors);
+    }
+
+    #[test]
+    fn saving_a_source_change_preserves_color_overrides() {
+        let mut settings =
+            Settings::parse(r##"{"claude":{"colors":{"normal":"#123456","warning":"#ABCDEF"}}}"##)
+                .unwrap();
+        settings.providers[0].source = Source::Windows;
+        let reloaded = Settings::parse(&settings.to_json().to_string()).unwrap();
+        assert_eq!(reloaded.providers, settings.providers);
+        assert_eq!(reloaded.colors, settings.colors);
+        assert_eq!(reloaded.colors[0].at(80.0), Rgb(171, 205, 239));
+    }
+
+    #[test]
+    fn malformed_colors_return_an_actionable_error() {
+        for colors in [
+            json!({"normal": "red"}),
+            json!({"normal": "123456"}),
+            json!({"normal": "#123"}),
+            json!({"normal": "#GG1234"}),
+            json!({"normal": "#é1234"}),
+            json!({"warning": 123456}),
+            json!({"warnng": "#123456"}),
+            json!([]),
+        ] {
+            let content = json!({"claude": {"colors": colors}}).to_string();
+            let error = Settings::parse(&content).unwrap_err();
+            assert!(error.contains("claude.colors"));
+            assert!(error.contains("#RRGGBB"));
+        }
     }
 }

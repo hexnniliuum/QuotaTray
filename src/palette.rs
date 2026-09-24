@@ -3,6 +3,35 @@ use crate::model::{Provider, ServiceStatusLevel};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UsageColors {
+    pub normal: Rgb,
+    pub warning: Rgb,
+}
+
+impl UsageColors {
+    pub fn for_provider(provider: Provider) -> Self {
+        match provider {
+            Provider::Claude => Self {
+                normal: Rgb(222, 134, 89),
+                warning: Rgb(242, 100, 64),
+            },
+            Provider::Codex => Self {
+                normal: Rgb(229, 231, 235),
+                warning: Rgb(241, 107, 141),
+            },
+        }
+    }
+
+    pub fn at(self, used_percent: f64) -> Rgb {
+        if used_percent >= 80.0 {
+            self.warning
+        } else {
+            self.normal
+        }
+    }
+}
+
 pub const BACKGROUND: Rgb = Rgb(28, 28, 30);
 pub const CARD: Rgb = Rgb(36, 36, 38);
 pub const CARD_RULE: Rgb = Rgb(49, 49, 51);
@@ -42,37 +71,41 @@ pub fn service_status_color(level: ServiceStatusLevel) -> Rgb {
     }
 }
 
-pub fn usage_color(provider: Provider, used_percent: f64) -> Rgb {
-    match (provider, used_percent) {
-        (Provider::Claude, value) if value >= 90.0 => Rgb(159, 18, 57),
-        (Provider::Claude, value) if value >= 70.0 => Rgb(249, 115, 22),
-        (Provider::Claude, _) => Rgb(34, 197, 94),
-        (Provider::Codex, value) if value >= 90.0 => Rgb(239, 68, 68),
-        (Provider::Codex, value) if value >= 70.0 => Rgb(250, 204, 21),
-        (Provider::Codex, _) => Rgb(59, 130, 246),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn provider_palettes_remain_distinct_at_each_threshold() {
-        for percentage in [20.0, 75.0, 95.0] {
-            let colors = Provider::ALL.map(|provider| usage_color(provider, percentage));
+        for percentage in [20.0, 75.0, 79.9, 80.0, 95.0] {
+            let colors =
+                Provider::ALL.map(|provider| UsageColors::for_provider(provider).at(percentage));
             assert_ne!(colors[0], colors[1]);
         }
     }
 
     #[test]
     fn colors_follow_the_provider_specific_severity_order() {
-        assert_eq!(usage_color(Provider::Claude, 20.0), Rgb(34, 197, 94));
-        assert_eq!(usage_color(Provider::Claude, 75.0), Rgb(249, 115, 22));
-        assert_eq!(usage_color(Provider::Claude, 95.0), Rgb(159, 18, 57));
-        assert_eq!(usage_color(Provider::Codex, 20.0), Rgb(59, 130, 246));
-        assert_eq!(usage_color(Provider::Codex, 75.0), Rgb(250, 204, 21));
-        assert_eq!(usage_color(Provider::Codex, 95.0), Rgb(239, 68, 68));
+        for percentage in [20.0, 75.0, 79.9] {
+            assert_eq!(
+                UsageColors::for_provider(Provider::Claude).at(percentage),
+                Rgb(222, 134, 89)
+            );
+            assert_eq!(
+                UsageColors::for_provider(Provider::Codex).at(percentage),
+                Rgb(229, 231, 235)
+            );
+        }
+        for percentage in [80.0, 95.0, 100.0] {
+            assert_eq!(
+                UsageColors::for_provider(Provider::Claude).at(percentage),
+                Rgb(242, 100, 64)
+            );
+            assert_eq!(
+                UsageColors::for_provider(Provider::Codex).at(percentage),
+                Rgb(241, 107, 141)
+            );
+        }
     }
 
     #[test]

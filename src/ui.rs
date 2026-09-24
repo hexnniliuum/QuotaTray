@@ -26,7 +26,7 @@ use crate::model::{
     ExtraUsageBudget, Provider, ProviderSnapshot, ServiceStatus, ServiceStatusLevel, UsageWindow,
     format_countdown, now_unix,
 };
-use crate::palette::{self, Rgb, blend};
+use crate::palette::{self, Rgb, UsageColors, blend};
 use crate::pulse::{self, Frame, Trace};
 use crate::settings::{self, Settings, Source};
 use crate::startup;
@@ -474,7 +474,7 @@ fn show_sources_menu(hwnd: HWND, state: &SharedState) -> Result<(), String> {
             std::process::Command::new("notepad.exe")
                 .arg(path)
                 .spawn()
-                .map_err(|_| "Could not open sources.json in Notepad.".to_string())?;
+                .map_err(|_| "Could not open config.json in Notepad.".to_string())?;
         }
         Ok(())
     })();
@@ -491,8 +491,11 @@ unsafe fn update_tray_icons(hwnd: HWND, state: &SharedState) {
     let mut handles = state.icon_handles.lock().unwrap();
     for (index, provider) in Provider::ALL.into_iter().enumerate() {
         if state.is_provider_visible(provider) {
-            let (icon, tooltip) =
-                create_usage_icon_and_tip(state.snapshot(provider), state.service_status(provider));
+            let (icon, tooltip) = create_usage_icon_and_tip(
+                state.snapshot(provider),
+                state.service_status(provider),
+                state.usage_colors(provider),
+            );
             let data = notification_data(hwnd, index as u32 + 1, icon, &tooltip);
             let operation = if handles[index].is_some() {
                 NIM_MODIFY
@@ -556,6 +559,7 @@ fn notification_data(hwnd: HWND, id: u32, icon: HICON, tooltip: &str) -> NOTIFYI
 fn create_usage_icon_and_tip(
     snapshot: ProviderSnapshot,
     service_status: ServiceStatus,
+    colors: UsageColors,
 ) -> (HICON, String) {
     let now = now_unix();
     let displayed = snapshot.displayed_window(now);
@@ -563,7 +567,7 @@ fn create_usage_icon_and_tip(
         .map(|window| format!("{:.0}", window.used_percent))
         .unwrap_or_else(|| "--".to_string());
     let color = displayed
-        .map(|window| palette::usage_color(snapshot.provider, window.used_percent))
+        .map(|window| colors.at(window.used_percent))
         .unwrap_or(palette::TRACK);
     let tooltip = if let Some(window) = displayed {
         format!(
@@ -956,6 +960,7 @@ fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> b
             dc,
             state.snapshot(provider),
             state.service_status(provider),
+            state.usage_colors(provider),
             metrics.provider_top(provider),
             layout,
             &mut cursor,
@@ -999,6 +1004,7 @@ fn paint_provider(
     dc: HDC,
     snapshot: ProviderSnapshot,
     service_status: ServiceStatus,
+    colors: UsageColors,
     top: i32,
     layout: Layout,
     cursor: &mut PulseCursor,
@@ -1076,17 +1082,11 @@ fn paint_provider(
         .into_iter()
         .flatten()
     {
-        paint_window_row(dc, snapshot.provider, window, row_top, layout, cursor);
+        paint_window_row(dc, colors, window, row_top, layout, cursor);
         row_top += WINDOW_ROW_HEIGHT;
     }
     if !snapshot.model_windows.is_empty() {
-        paint_model_pills(
-            dc,
-            snapshot.provider,
-            &snapshot.model_windows,
-            row_top,
-            layout,
-        );
+        paint_model_pills(dc, colors, &snapshot.model_windows, row_top, layout);
         row_top += MODEL_ROW_HEIGHT;
     }
     if let Some(budget) = snapshot.extra_usage.as_ref() {
@@ -1120,7 +1120,7 @@ fn paint_provider(
 /// the percentage, and the time until reset.
 fn paint_window_row(
     dc: HDC,
-    provider: Provider,
+    colors: UsageColors,
     window: &UsageWindow,
     top: i32,
     layout: Layout,
@@ -1134,7 +1134,7 @@ fn paint_window_row(
     } else {
         "Expired window"
     };
-    let color = palette::usage_color(provider, percentage);
+    let color = colors.at(percentage);
     draw_text(
         dc,
         layout,
@@ -1251,7 +1251,7 @@ fn paint_trace(
 
 fn paint_model_pills(
     dc: HDC,
-    provider: Provider,
+    colors: UsageColors,
     windows: &[UsageWindow],
     top: i32,
     layout: Layout,
@@ -1278,7 +1278,7 @@ fn paint_model_pills(
             palette::SOFT_TEXT,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
-        let color = palette::usage_color(provider, percentage);
+        let color = colors.at(percentage);
         paint_meter(
             dc,
             layout.rect(left + 4, top + 24, right - 4, top + 26),
