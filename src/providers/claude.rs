@@ -45,13 +45,17 @@ fn fetch_usage(token: &str) -> Result<ProviderSnapshot, String> {
         .map_err(|error| format!("Claude returned invalid usage data: {error}"))?;
     let mut snapshot = ProviderSnapshot::empty(Provider::Claude);
     snapshot.session = parse_window(&value, "five_hour", "Session")
-        .or_else(|| parse_limit_window(&value, "session", "Session", None));
+        .or_else(|| parse_limit_window(&value, "session", "Session", None))
+        .map(|window| window.with_duration_secs(Some(FIVE_HOURS)));
     snapshot.weekly = parse_window(&value, "seven_day", "Weekly")
-        .or_else(|| parse_limit_window(&value, "weekly_all", "Weekly", None));
+        .or_else(|| parse_limit_window(&value, "weekly_all", "Weekly", None))
+        .map(|window| window.with_duration_secs(Some(SEVEN_DAYS)));
     if let Some(fable) = parse_limit_window(&value, "weekly_scoped", "Fable 5", Some("fable"))
         .or_else(|| parse_window(&value, "seven_day_overage_included", "Fable 5"))
     {
-        snapshot.model_windows.push(fable);
+        snapshot
+            .model_windows
+            .push(fable.with_duration_secs(Some(SEVEN_DAYS)));
     }
     snapshot.extra_usage = parse_extra_usage(&value);
     snapshot.last_updated_unix = Some(now_unix());
@@ -78,6 +82,9 @@ fn read_access_token_from(path: &std::path::Path) -> Result<String, String> {
         .map(str::to_owned)
         .ok_or_else(|| "Claude OAuth login was not found.".to_string())
 }
+
+const FIVE_HOURS: i64 = 5 * 3_600;
+const SEVEN_DAYS: i64 = 7 * 86_400;
 
 fn parse_window(root: &Value, key: &str, label: &str) -> Option<UsageWindow> {
     let value = root.get(key)?;

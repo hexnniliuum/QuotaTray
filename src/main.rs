@@ -6,6 +6,7 @@ mod model;
 mod palette;
 mod process;
 mod providers;
+mod pulse;
 mod registry;
 mod service_status;
 mod settings;

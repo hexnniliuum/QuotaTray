@@ -7,6 +7,10 @@ use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -22,7 +26,8 @@ use crate::model::{
     ExtraUsageBudget, Provider, ProviderSnapshot, ServiceStatus, ServiceStatusLevel, UsageWindow,
     format_countdown, now_unix,
 };
-use crate::palette::{self, Rgb};
+use crate::palette::{self, Rgb, blend};
+use crate::pulse::{self, Frame, Trace};
 use crate::settings::{self, Settings, Source};
 use crate::startup;
 
@@ -30,13 +35,25 @@ const WM_TRAY: u32 = 0x8002;
 const TRAY_CLASS: PCWSTR = w!("QuotaTray.MessageWindow");
 const DASHBOARD_CLASS: PCWSTR = w!("QuotaTray.DashboardWindow");
 const DASHBOARD_WIDTH: i32 = 380;
+const CONTENT_LEFT: i32 = 16;
+const CONTENT_RIGHT: i32 = 364;
+const CARD_LEFT: i32 = 30;
+const CARD_RIGHT: i32 = 350;
+const CARD_PAD_TOP: i32 = 12;
+const CARD_PAD_BOTTOM: i32 = 10;
 const CARD_HEADER_HEIGHT: i32 = 30;
-const CARD_GAP: i32 = 7;
+const CARD_GAP: i32 = 8;
+const CARD_RADIUS: i32 = 10;
 const HISTORY_ROW_HEIGHT: i32 = 20;
-const WINDOW_ROW_HEIGHT: i32 = 52;
-const MODEL_ROW_HEIGHT: i32 = 36;
-const EXTRA_USAGE_ROW_HEIGHT: i32 = 28;
+const WINDOW_ROW_HEIGHT: i32 = 46;
+const MODEL_ROW_HEIGHT: i32 = 30;
+const EXTRA_USAGE_ROW_HEIGHT: i32 = 30;
 const MESSAGE_ROW_HEIGHT: i32 = 54;
+const FOOTER_HEIGHT: i32 = 40;
+/// Right edge of the usage bars; the percentage and reset columns follow.
+const BARS_RIGHT: i32 = 224;
+const PULSE_TIMER: usize = 1;
+const PULSE_FRAME_MS: u32 = 16;
 const MENU_SOURCE_BASE: usize = 1;
 const MENU_ADVANCED_SETTINGS: usize = MENU_SOURCE_BASE + Provider::COUNT * Source::ALL.len();
 
@@ -78,11 +95,11 @@ impl DashboardMetrics {
             provider_tops[provider.index()] = next_top;
             next_top += provider_height(&state.snapshot(provider));
         }
-        let footer_top = next_top + 30;
+        let footer_top = next_top + 4;
         Self {
             provider_tops,
             footer_top,
-            height: footer_top + 50,
+            height: footer_top + FOOTER_HEIGHT,
         }
     }
 
@@ -91,43 +108,51 @@ impl DashboardMetrics {
     }
 
     fn refresh_rect(self, layout: Layout) -> RECT {
-        layout.rect(282, 12, 364, 44)
+        layout.rect(292, 16, CONTENT_RIGHT, 44)
     }
 
     fn startup_rect(self, layout: Layout) -> RECT {
-        layout.rect(16, self.footer_top, 210, self.footer_top + 36)
+        layout.rect(140, self.footer_top + 4, 270, self.footer_top + 28)
     }
 
     fn provider_toggle_rect(self, provider: Provider, layout: Layout) -> RECT {
-        let left = 16 + provider.index() as i32 * 116;
-        layout.rect(left, self.footer_top - 26, left + 108, self.footer_top - 4)
+        let left = CONTENT_LEFT + provider.index() as i32 * 62;
+        layout.rect(left, self.footer_top + 4, left + 56, self.footer_top + 28)
     }
 
     fn sources_rect(self, layout: Layout) -> RECT {
-        layout.rect(218, self.footer_top, 298, self.footer_top + 36)
+        layout.rect(278, self.footer_top + 4, 330, self.footer_top + 28)
     }
 
     fn exit_rect(self, layout: Layout) -> RECT {
-        layout.rect(306, self.footer_top, 364, self.footer_top + 36)
+        layout.rect(
+            338,
+            self.footer_top + 4,
+            CONTENT_RIGHT,
+            self.footer_top + 28,
+        )
     }
 }
 
+/// Height of a provider card including the gap below it.
 fn provider_height(snapshot: &ProviderSnapshot) -> i32 {
     let window_count =
         usize::from(snapshot.session.is_some()) + usize::from(snapshot.weekly.is_some());
     let has_usage =
         window_count > 0 || !snapshot.model_windows.is_empty() || snapshot.extra_usage.is_some();
-    CARD_HEADER_HEIGHT
-        + CARD_GAP
-        + window_count as i32 * WINDOW_ROW_HEIGHT
-        + snapshot.model_windows.len() as i32 * MODEL_ROW_HEIGHT
-        + i32::from(snapshot.extra_usage.is_some()) * EXTRA_USAGE_ROW_HEIGHT
+    CARD_PAD_TOP
+        + CARD_HEADER_HEIGHT
         + i32::from(snapshot.from_session_history) * HISTORY_ROW_HEIGHT
+        + window_count as i32 * WINDOW_ROW_HEIGHT
+        + i32::from(!snapshot.model_windows.is_empty()) * MODEL_ROW_HEIGHT
+        + i32::from(snapshot.extra_usage.is_some()) * EXTRA_USAGE_ROW_HEIGHT
         + if !has_usage || snapshot.error.is_some() {
             MESSAGE_ROW_HEIGHT
         } else {
             0
         }
+        + CARD_PAD_BOTTOM
+        + CARD_GAP
 }
 
 fn error_summary(error: &str) -> String {
@@ -234,8 +259,14 @@ unsafe extern "system" fn tray_proc(
         WM_USAGE_UPDATED => {
             if let Some(state) = state_from_window(hwnd) {
                 unsafe { update_tray_icons(hwnd, state) };
+                let generation = state.refresh_generation.load(Ordering::Relaxed);
+                let refresh_started = state.refreshing.load(Ordering::Relaxed)
+                    && state.pulsed_generation.swap(generation, Ordering::Relaxed) != generation;
                 if let Some(dashboard) = state.dashboard_window() {
                     unsafe {
+                        if refresh_started && IsWindowVisible(dashboard).as_bool() {
+                            begin_pulse(dashboard, state);
+                        }
                         resize_dashboard_to_content(dashboard, state);
                         let _ = InvalidateRect(Some(dashboard), None, false);
                     };
@@ -290,6 +321,7 @@ unsafe extern "system" fn dashboard_proc(
                 let x = (lparam.0 as i16) as i32;
                 let y = ((lparam.0 >> 16) as i16) as i32;
                 if point_in_rect(x, y, metrics.refresh_rect(layout)) {
+                    // The worker announces the refresh start, which begins the trace.
                     state.request_refresh();
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -325,17 +357,30 @@ unsafe extern "system" fn dashboard_proc(
                         && point_in_rect(
                             x,
                             y,
-                            layout.rect(16, top, 364, top + provider_height(&snapshot)),
+                            layout.rect(
+                                CONTENT_LEFT,
+                                top,
+                                CONTENT_RIGHT,
+                                top + provider_height(&snapshot) - CARD_GAP,
+                            ),
                         ))
                     .then_some(snapshot.error)
                     .flatten()
                 }) {
                     crate::show_error(&error);
-                } else if point_in_rect(x, y, metrics.exit_rect(layout)) {
-                    if let Some(tray) = state.tray_window() {
-                        unsafe { PostMessageW(Some(tray), WM_CLOSE, WPARAM(0), LPARAM(0)).ok() };
-                    }
+                } else if point_in_rect(x, y, metrics.exit_rect(layout))
+                    && let Some(tray) = state.tray_window()
+                {
+                    unsafe { PostMessageW(Some(tray), WM_CLOSE, WPARAM(0), LPARAM(0)).ok() };
                 }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == PULSE_TIMER {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                };
             }
             LRESULT(0)
         }
@@ -344,6 +389,9 @@ unsafe extern "system" fn dashboard_proc(
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 };
+                if let Some(state) = state_from_window(hwnd) {
+                    unsafe { end_pulse(hwnd, state) };
+                }
             }
             LRESULT(0)
         }
@@ -396,7 +444,7 @@ fn show_sources_menu(hwnd: HWND, state: &SharedState) -> Result<(), String> {
                 w!("Edit advanced settings..."),
             )
         }
-            .map_err(|_| "Could not build Sources menu.".to_string())?;
+        .map_err(|_| "Could not build Sources menu.".to_string())?;
         let mut point = POINT::default();
         unsafe { GetCursorPos(&mut point) }
             .map_err(|_| "Cursor position unavailable.".to_string())?;
@@ -693,22 +741,10 @@ fn status_inner_glow(level: ServiceStatusLevel) -> Option<(Rgb, f64)> {
     Some((palette::service_status_color(level), strength))
 }
 
-fn blend(background: Rgb, foreground: Rgb, amount: f64) -> Rgb {
-    let amount = amount.clamp(0.0, 1.0);
-    let channel = |background: u8, foreground: u8| {
-        (f64::from(background) * (1.0 - amount) + f64::from(foreground) * amount).round() as u8
-    };
-    Rgb(
-        channel(background.0, foreground.0),
-        channel(background.1, foreground.1),
-        channel(background.2, foreground.2),
-    )
-}
-
 unsafe fn create_dashboard(owner: HWND, state: &SharedState) -> Option<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.ok()?;
     let pointer = state as *const SharedState;
-    unsafe {
+    let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             DASHBOARD_CLASS,
@@ -724,7 +760,18 @@ unsafe fn create_dashboard(owner: HWND, state: &SharedState) -> Option<HWND> {
             Some(pointer.cast()),
         )
     }
-    .ok()
+    .ok()?;
+    let corners = DWMWCP_ROUND;
+    unsafe {
+        // Windows 11 rounds the popup; older versions ignore the request.
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+    }
+    Some(hwnd)
 }
 
 unsafe fn toggle_dashboard(owner: HWND, state: &SharedState) {
@@ -741,6 +788,7 @@ unsafe fn toggle_dashboard(owner: HWND, state: &SharedState) {
     if unsafe { IsWindowVisible(dashboard).as_bool() } {
         unsafe {
             let _ = ShowWindow(dashboard, SW_HIDE);
+            end_pulse(dashboard, state);
         };
         return;
     }
@@ -814,32 +862,92 @@ unsafe fn resize_dashboard_to_content(hwnd: HWND, state: &SharedState) {
     }
 }
 
+unsafe fn begin_pulse(hwnd: HWND, state: &SharedState) {
+    state.start_pulse();
+    unsafe {
+        SetTimer(Some(hwnd), PULSE_TIMER, PULSE_FRAME_MS, None);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+unsafe fn end_pulse(hwnd: HWND, state: &SharedState) {
+    state.clear_pulse();
+    unsafe {
+        let _ = KillTimer(Some(hwnd), PULSE_TIMER);
+    }
+}
+
+/// The running refresh trace, as the painter sees it.
+#[derive(Clone, Copy)]
+struct PulseClock {
+    elapsed_ms: f64,
+    seed: u64,
+}
+
+/// Where the next usage bar sits in the pulse sequence and whether any bar is
+/// still drawing.
+struct PulseCursor {
+    clock: Option<PulseClock>,
+    next_bar: usize,
+    animating: bool,
+}
+
 unsafe fn paint_dashboard(hwnd: HWND, state: &SharedState) {
     let mut paint = PAINTSTRUCT::default();
     let dc = unsafe { BeginPaint(hwnd, &mut paint) };
-    let layout = layout_for_window(hwnd);
-    let metrics = DashboardMetrics::from_state(state);
     let mut client = RECT::default();
     unsafe { GetClientRect(hwnd, &mut client).ok() };
+    let width = (client.right - client.left).max(1);
+    let height = (client.bottom - client.top).max(1);
+    // Draw into an off-screen bitmap so the animation never flickers.
+    let buffer = unsafe { CreateCompatibleDC(Some(dc)) };
+    let bitmap = unsafe { CreateCompatibleBitmap(dc, width, height) };
+    let previous = unsafe { SelectObject(buffer, bitmap.into()) };
+    let animating = render_dashboard(buffer, client, hwnd, state);
+    unsafe {
+        let _ = BitBlt(dc, 0, 0, width, height, Some(buffer), 0, 0, SRCCOPY);
+        SelectObject(buffer, previous);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(buffer);
+        let _ = EndPaint(hwnd, &paint);
+    }
+    if !animating && state.pulse().is_some() {
+        unsafe { end_pulse(hwnd, state) };
+    }
+}
+
+/// Paints the whole dashboard; returns whether a refresh trace is still running.
+fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> bool {
+    let layout = layout_for_window(hwnd);
+    let metrics = DashboardMetrics::from_state(state);
     fill_rect(dc, client, palette::BACKGROUND);
     unsafe { SetBkMode(dc, TRANSPARENT) };
 
     draw_text(
         dc,
-        layout.rect(16, 12, 250, 42),
+        layout,
+        layout.rect(CONTENT_LEFT, 16, 200, 44),
         "Usage",
-        22,
-        FW_BOLD.0 as i32,
+        Font::semibold(17),
         palette::TEXT,
-        DT_LEFT,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     let refreshing = state.refreshing.load(Ordering::Relaxed);
     draw_button(
         dc,
         metrics.refresh_rect(layout),
-        if refreshing { "Working" } else { "Refresh" },
+        if refreshing { "Working…" } else { "Refresh" },
+        layout,
     );
 
+    let mut cursor = PulseCursor {
+        clock: state.pulse().map(|pulse| PulseClock {
+            elapsed_ms: pulse.started.elapsed().as_secs_f64() * 1_000.0,
+            seed: pulse.seed,
+        }),
+        next_bar: 0,
+        animating: false,
+    };
     for provider in Provider::ALL {
         if !state.is_provider_visible(provider) {
             continue;
@@ -850,41 +958,41 @@ unsafe fn paint_dashboard(hwnd: HWND, state: &SharedState) {
             state.service_status(provider),
             metrics.provider_top(provider),
             layout,
+            &mut cursor,
         );
     }
 
     for provider in Provider::ALL {
-        let marker = if state.is_provider_visible(provider) {
-            "✓ "
-        } else {
-            ""
-        };
-        draw_text(
+        let visible = state.is_provider_visible(provider);
+        draw_chip(
             dc,
+            layout,
             metrics.provider_toggle_rect(provider, layout),
-            &format!("{marker}{}", provider.name()),
-            11,
-            FW_NORMAL.0 as i32,
-            if state.is_provider_visible(provider) {
-                palette::TEXT
-            } else {
-                palette::MUTED_TEXT
-            },
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            provider.name(),
+            visible,
         );
     }
-
     let startup_label = if state.start_with_windows.load(Ordering::Relaxed) {
-        "✓ Start with Windows"
+        "Start with Windows ✓"
     } else {
         "Start with Windows"
     };
-    draw_button(dc, metrics.startup_rect(layout), startup_label);
-    draw_button(dc, metrics.sources_rect(layout), "Sources");
-    draw_button(dc, metrics.exit_rect(layout), "Exit");
-    unsafe {
-        let _ = EndPaint(hwnd, &paint);
-    };
+    for (rect, label) in [
+        (metrics.startup_rect(layout), startup_label),
+        (metrics.sources_rect(layout), "Sources"),
+        (metrics.exit_rect(layout), "Exit"),
+    ] {
+        draw_text(
+            dc,
+            layout,
+            rect,
+            label,
+            Font::regular(11),
+            palette::MUTED_TEXT,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+    cursor.animating
 }
 
 fn paint_provider(
@@ -893,215 +1001,448 @@ fn paint_provider(
     service_status: ServiceStatus,
     top: i32,
     layout: Layout,
+    cursor: &mut PulseCursor,
 ) {
     let now = now_unix();
-    let status_left = match snapshot.provider {
-        Provider::Claude => 78,
-        Provider::Codex => 70,
+    let card_bottom = top + provider_height(&snapshot) - CARD_GAP;
+    fill_round_rect(
+        dc,
+        layout.rect(CONTENT_LEFT, top, CONTENT_RIGHT, card_bottom),
+        layout.px(CARD_RADIUS),
+        palette::CARD,
+    );
+
+    let header_top = top + CARD_PAD_TOP;
+    let header_rect = |left: i32, right: i32| {
+        layout.rect(left, header_top, right, header_top + CARD_HEADER_HEIGHT - 8)
     };
+    let name_width = measure_text(dc, layout, snapshot.provider.name(), Font::bold(14));
     draw_text(
         dc,
-        layout.rect(16, top, status_left - 2, top + 25),
+        layout,
+        header_rect(CARD_LEFT, CARD_LEFT + name_width + 4),
         snapshot.provider.name(),
-        16,
-        FW_BOLD.0 as i32,
+        Font::bold(14),
         palette::TEXT,
-        DT_LEFT,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+    let dot_left = CARD_LEFT + name_width + 8;
+    let dot_top = header_top + (CARD_HEADER_HEIGHT - 8) / 2 - 3;
+    fill_ellipse(
+        dc,
+        layout.rect(dot_left, dot_top, dot_left + 6, dot_top + 6),
+        palette::service_status_color(service_status.level),
     );
     draw_text(
         dc,
-        layout.rect(status_left, top, 242, top + 25),
+        layout,
+        header_rect(dot_left + 11, 250),
         service_status.label(),
-        11,
-        FW_NORMAL.0 as i32,
-        palette::service_status_color(service_status.level),
+        Font::regular(11),
+        palette::MUTED_TEXT,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     if !snapshot.from_session_history {
         draw_text(
             dc,
-            layout.rect(242, top, 364, top + 25),
+            layout,
+            header_rect(250, CARD_RIGHT),
             &if snapshot.error.is_some() {
                 "Refresh failed".into()
             } else {
                 snapshot.freshness_label(now)
             },
-            12,
-            FW_NORMAL.0 as i32,
-            palette::MUTED_TEXT,
-            DT_RIGHT,
+            Font::regular(11),
+            palette::DIM_TEXT,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
     }
-    let mut window_top = top + CARD_HEADER_HEIGHT;
+
+    let mut row_top = header_top + CARD_HEADER_HEIGHT;
     if snapshot.from_session_history {
         draw_text(
             dc,
-            layout.rect(16, window_top, 364, window_top + HISTORY_ROW_HEIGHT),
+            layout,
+            layout.rect(CARD_LEFT, row_top, CARD_RIGHT, row_top + HISTORY_ROW_HEIGHT),
             &snapshot.freshness_label(now),
-            11,
-            FW_NORMAL.0 as i32,
-            palette::MUTED_TEXT,
+            Font::regular(11),
+            palette::DIM_TEXT,
             DT_LEFT | DT_SINGLELINE,
         );
-        window_top += HISTORY_ROW_HEIGHT;
+        row_top += HISTORY_ROW_HEIGHT;
     }
-    let windows_start = window_top;
+    let rows_start = row_top;
     for window in [snapshot.session.as_ref(), snapshot.weekly.as_ref()]
         .into_iter()
         .flatten()
     {
-        paint_window(dc, snapshot.provider, window, window_top, layout);
-        draw_text(
-            dc,
-            layout.rect(16, window_top + 34, 364, window_top + 51),
-            &format_countdown(window.resets_at_unix, now),
-            11,
-            FW_NORMAL.0 as i32,
-            palette::MUTED_TEXT,
-            DT_LEFT,
-        );
-        window_top += WINDOW_ROW_HEIGHT;
+        paint_window_row(dc, snapshot.provider, window, row_top, layout, cursor);
+        row_top += WINDOW_ROW_HEIGHT;
     }
-    for window in &snapshot.model_windows {
-        paint_window(dc, snapshot.provider, window, window_top, layout);
-        window_top += MODEL_ROW_HEIGHT;
+    if !snapshot.model_windows.is_empty() {
+        paint_model_pills(
+            dc,
+            snapshot.provider,
+            &snapshot.model_windows,
+            row_top,
+            layout,
+        );
+        row_top += MODEL_ROW_HEIGHT;
     }
     if let Some(budget) = snapshot.extra_usage.as_ref() {
-        paint_extra_usage(dc, snapshot.provider, budget, window_top, layout);
-        window_top += EXTRA_USAGE_ROW_HEIGHT;
+        paint_extra_usage(dc, budget, row_top, layout);
+        row_top += EXTRA_USAGE_ROW_HEIGHT;
     }
-    if window_top == windows_start || snapshot.error.is_some() {
-        let error = snapshot
+    if row_top == rows_start || snapshot.error.is_some() {
+        let message = snapshot
             .error
             .as_deref()
             .map(error_summary)
             .unwrap_or_else(|| "Waiting for usage...".into());
         draw_text(
             dc,
-            layout.rect(16, window_top, 364, window_top + MESSAGE_ROW_HEIGHT),
-            &error,
-            12,
-            FW_NORMAL.0 as i32,
+            layout,
+            layout.rect(
+                CARD_LEFT,
+                row_top + 4,
+                CARD_RIGHT,
+                row_top + MESSAGE_ROW_HEIGHT,
+            ),
+            &message,
+            Font::regular(12),
             palette::MUTED_TEXT,
             DT_LEFT | DT_WORDBREAK,
         );
     }
 }
 
-fn paint_window(dc: HDC, provider: Provider, window: &UsageWindow, top: i32, layout: Layout) {
-    let applicable = window.is_applicable(now_unix());
+/// A usage window: label, the usage bar with the elapsed-time bar beneath it,
+/// the percentage, and the time until reset.
+fn paint_window_row(
+    dc: HDC,
+    provider: Provider,
+    window: &UsageWindow,
+    top: i32,
+    layout: Layout,
+    cursor: &mut PulseCursor,
+) {
+    let now = now_unix();
+    let applicable = window.is_applicable(now);
     let percentage = if applicable { window.used_percent } else { 0.0 };
     let label = if applicable {
         window.label.as_str()
     } else {
         "Expired window"
     };
+    let color = palette::usage_color(provider, percentage);
     draw_text(
         dc,
-        layout.rect(16, top, 250, top + 20),
+        layout,
+        layout.rect(CARD_LEFT, top + 4, BARS_RIGHT, top + 20),
         label,
-        12,
-        FW_NORMAL.0 as i32,
+        Font::regular(12),
         palette::TEXT,
-        DT_LEFT,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
+    let track = layout.rect(CARD_LEFT, top + 25, BARS_RIGHT, top + 30);
+    let fill_end = paint_meter(dc, track, percentage, color, palette::CARD);
+    if let Some(elapsed) = window.elapsed_percent(now).filter(|_| applicable) {
+        let elapsed_track = layout.rect(CARD_LEFT, top + 34, BARS_RIGHT, top + 36);
+        paint_meter(
+            dc,
+            elapsed_track,
+            elapsed,
+            blend(palette::CARD, palette::ELAPSED, 0.5),
+            palette::CARD,
+        );
+    }
     draw_text(
         dc,
-        layout.rect(250, top, 364, top + 20),
+        layout,
+        layout.rect(BARS_RIGHT + 12, top + 18, BARS_RIGHT + 56, top + 34),
         &format!("{:.0}%", percentage),
-        14,
-        FW_BOLD.0 as i32,
-        palette::usage_color(provider, percentage),
-        DT_RIGHT,
+        Font::bold(13),
+        palette::TEXT,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
-    let track = layout.rect(16, top + 23, 364, top + 30);
-    fill_rect(dc, track, palette::TRACK);
-    let mut fill = track;
-    fill.right = fill.left + ((fill.right - fill.left) as f64 * percentage / 100.0) as i32;
-    fill_rect(dc, fill, palette::usage_color(provider, percentage));
+    let countdown = format_countdown(window.resets_at_unix, now);
+    let countdown = match countdown.strip_prefix("resets in ") {
+        Some(remaining) => remaining,
+        None if window.resets_at_unix.is_none() => "no reset",
+        None => countdown.as_str(),
+    };
+    draw_text(
+        dc,
+        layout,
+        layout.rect(BARS_RIGHT + 68, top + 20, CARD_RIGHT, top + 34),
+        countdown,
+        Font::regular(11),
+        palette::DIM_TEXT,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+    );
+    paint_trace(dc, track, fill_end, color, layout, cursor);
 }
 
-fn paint_extra_usage(
+/// Fills a bar and returns the device-pixel x where the fill ends.
+fn paint_meter(dc: HDC, track: RECT, percentage: f64, color: Rgb, surface: Rgb) -> i32 {
+    fill_rect(dc, track, blend(surface, color, 0.2));
+    let mut fill = track;
+    fill.right = fill.left + ((fill.right - fill.left) as f64 * percentage / 100.0).round() as i32;
+    if fill.right > fill.left {
+        fill_rect(dc, fill, color);
+    }
+    fill.right
+}
+
+/// Draws this bar's part of the refresh trace and advances the pulse cursor.
+fn paint_trace(
+    dc: HDC,
+    track: RECT,
+    fill_end: i32,
+    color: Rgb,
+    layout: Layout,
+    cursor: &mut PulseCursor,
+) {
+    let index = cursor.next_bar;
+    cursor.next_bar += 1;
+    let Some(clock) = cursor.clock else {
+        return;
+    };
+    let scale = f64::from(layout.scale);
+    let width = f64::from(track.right - track.left) / scale;
+    let trace = Trace::build(
+        width,
+        f64::from(fill_end - track.left) / scale,
+        clock.seed,
+        index,
+    );
+    let local_ms = clock.elapsed_ms - index as f64 * pulse::STAGGER_MS;
+    if local_ms < 0.0 {
+        cursor.animating = true;
+        return;
+    }
+    let Some(frame) = Frame::at(&trace, local_ms) else {
+        return;
+    };
+    cursor.animating = true;
+    let center_y = f64::from(track.top + track.bottom) / 2.0;
+    let to_device = |points: &[(f64, f64)]| {
+        points
+            .iter()
+            .map(|(x, y)| POINT {
+                x: (f64::from(track.left) + x * scale).round() as i32,
+                y: (center_y + y * scale).round() as i32,
+            })
+            .collect::<Vec<_>>()
+    };
+    draw_polyline(
+        dc,
+        &to_device(&frame.trail),
+        blend(palette::CARD, color, 0.55 * frame.trail_opacity),
+        1,
+    );
+    draw_polyline(
+        dc,
+        &to_device(&frame.head),
+        palette::TRACE_HEAD,
+        ((1.5 * scale) as i32).max(1),
+    );
+}
+
+fn paint_model_pills(
     dc: HDC,
     provider: Provider,
-    budget: &ExtraUsageBudget,
+    windows: &[UsageWindow],
     top: i32,
     layout: Layout,
 ) {
-    let right_label = budget
-        .remaining_minor()
-        .zip(budget.limit_minor)
-        .map(|(remaining, limit)| {
-            format!(
-                "{} left of {}",
-                budget.format_amount(remaining),
-                budget.format_amount(limit)
-            )
-        })
-        .unwrap_or_else(|| format!("{} spent · no cap", budget.format_amount(budget.used_minor)));
+    let now = now_unix();
+    let mut left = CARD_LEFT;
+    for window in windows {
+        let applicable = window.is_applicable(now);
+        let percentage = if applicable { window.used_percent } else { 0.0 };
+        let text = format!("{} · {:.0}%", window.label, percentage);
+        let width = measure_text(dc, layout, &text, Font::regular(11)) + 16;
+        let right = (left + width).min(CARD_RIGHT);
+        if right - left < 24 {
+            break;
+        }
+        let pill = layout.rect(left, top + 2, right, top + 26);
+        fill_round_rect(dc, pill, layout.px(6), palette::PILL);
+        draw_text(
+            dc,
+            layout,
+            layout.rect(left, top + 2, right, top + 24),
+            &text,
+            Font::regular(11),
+            palette::SOFT_TEXT,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        let color = palette::usage_color(provider, percentage);
+        paint_meter(
+            dc,
+            layout.rect(left + 4, top + 24, right - 4, top + 26),
+            percentage,
+            color,
+            palette::PILL,
+        );
+        left = right + 6;
+    }
+}
+
+fn paint_extra_usage(dc: HDC, budget: &ExtraUsageBudget, top: i32, layout: Layout) {
+    fill_rect(
+        dc,
+        layout.rect(CARD_LEFT, top + 2, CARD_RIGHT, top + 3),
+        palette::CARD_RULE,
+    );
+    let text_rect = |left: i32, right: i32| layout.rect(left, top + 9, right, top + 27);
     draw_text(
         dc,
-        layout.rect(16, top, 180, top + 22),
+        layout,
+        text_rect(CARD_LEFT, 180),
         "Extra usage",
-        12,
-        FW_NORMAL.0 as i32,
-        palette::TEXT,
-        DT_LEFT,
+        Font::regular(11),
+        palette::DIM_TEXT,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+    let (amount, suffix) = match budget.remaining_minor().zip(budget.limit_minor) {
+        Some((remaining, limit)) => (
+            budget.format_amount(remaining),
+            format!(" left of {}", budget.format_amount(limit)),
+        ),
+        None => (
+            budget.format_amount(budget.used_minor),
+            " spent · no cap".to_string(),
+        ),
+    };
+    let suffix_width = measure_text(dc, layout, &suffix, Font::regular(11));
+    draw_text(
+        dc,
+        layout,
+        text_rect(180, CARD_RIGHT),
+        &suffix,
+        Font::regular(11),
+        palette::DIM_TEXT,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
     draw_text(
         dc,
-        layout.rect(180, top, 364, top + 22),
-        &right_label,
-        12,
-        FW_BOLD.0 as i32,
-        budget
-            .used_percent()
-            .map(|value| palette::usage_color(provider, value))
-            .unwrap_or(palette::MUTED_TEXT),
-        DT_RIGHT,
+        layout,
+        text_rect(180, CARD_RIGHT - suffix_width),
+        &amount,
+        Font::semibold(11),
+        palette::TEXT,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
 }
 
-fn draw_button(dc: HDC, rect: RECT, label: &str) {
-    fill_rect(dc, rect, Rgb(52, 52, 56));
+fn draw_button(dc: HDC, rect: RECT, label: &str, layout: Layout) {
+    fill_round_rect(dc, rect, layout.px(6), palette::BUTTON);
     draw_text(
         dc,
+        layout,
         rect,
         label,
-        12,
-        FW_NORMAL.0 as i32,
+        Font::regular(12),
         palette::TEXT,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
 }
 
-fn draw_text(
-    dc: HDC,
-    mut rect: RECT,
-    value: &str,
+fn draw_chip(dc: HDC, layout: Layout, rect: RECT, label: &str, on: bool) {
+    fill_round_rect(dc, rect, rect.bottom - rect.top, palette::CHIP);
+    let font = Font::regular(11);
+    draw_text(
+        dc,
+        layout,
+        rect,
+        label,
+        if on { font } else { font.strikeout() },
+        if on {
+            palette::SOFT_TEXT
+        } else {
+            palette::OFF_TEXT
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+}
+
+/// Text size and weight in layout pixels.
+#[derive(Clone, Copy)]
+struct Font {
     size: i32,
-    weight: i32,
-    color: Rgb,
-    alignment: DRAW_TEXT_FORMAT,
-) {
+    weight: FONT_WEIGHT,
+    strikeout: bool,
+}
+
+impl Font {
+    const fn regular(size: i32) -> Self {
+        Self {
+            size,
+            weight: FW_NORMAL,
+            strikeout: false,
+        }
+    }
+
+    const fn semibold(size: i32) -> Self {
+        Self {
+            size,
+            weight: FW_SEMIBOLD,
+            strikeout: false,
+        }
+    }
+
+    const fn bold(size: i32) -> Self {
+        Self {
+            size,
+            weight: FW_BOLD,
+            strikeout: false,
+        }
+    }
+
+    const fn strikeout(self) -> Self {
+        Self {
+            strikeout: true,
+            ..self
+        }
+    }
+}
+
+/// Sizes the font from the window's DPI, not the device context's, so text
+/// matches the layout on every monitor.
+fn create_font(layout: Layout, font: Font) -> HFONT {
     unsafe {
-        let font_height = -((size * GetDeviceCaps(Some(dc), LOGPIXELSY) + 48) / 96).max(1);
-        let font = CreateFontW(
-            font_height,
+        CreateFontW(
+            -layout.px(font.size).max(1),
             0,
             0,
             0,
-            weight,
+            font.weight.0 as i32,
             0,
             0,
-            0,
+            u32::from(font.strikeout),
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,
             DEFAULT_PITCH.0 as u32,
             w!("Segoe UI"),
-        );
+        )
+    }
+}
+
+fn draw_text(
+    dc: HDC,
+    layout: Layout,
+    mut rect: RECT,
+    value: &str,
+    font: Font,
+    color: Rgb,
+    alignment: DRAW_TEXT_FORMAT,
+) {
+    unsafe {
+        let font = create_font(layout, font);
         let old = SelectObject(dc, font.into());
         SetTextColor(dc, colorref(color));
         let mut text = value.encode_utf16().collect::<Vec<_>>();
@@ -1111,11 +1452,90 @@ fn draw_text(
     }
 }
 
+/// Width of `value` in layout pixels.
+fn measure_text(dc: HDC, layout: Layout, value: &str, font: Font) -> i32 {
+    unsafe {
+        let font = create_font(layout, font);
+        let old = SelectObject(dc, font.into());
+        let mut text = value.encode_utf16().collect::<Vec<_>>();
+        let mut rect = RECT::default();
+        DrawTextW(
+            dc,
+            &mut text,
+            &mut rect,
+            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(dc, old);
+        let _ = DeleteObject(font.into());
+        ((rect.right - rect.left) as f32 / layout.scale).ceil() as i32
+    }
+}
+
 fn fill_rect(dc: HDC, rect: RECT, color: Rgb) {
     unsafe {
         let brush = CreateSolidBrush(colorref(color));
         FillRect(dc, &rect, brush);
         let _ = DeleteObject(brush.into());
+    }
+}
+
+fn fill_round_rect(dc: HDC, rect: RECT, radius: i32, color: Rgb) {
+    unsafe {
+        let brush = CreateSolidBrush(colorref(color));
+        let old_brush = SelectObject(dc, brush.into());
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        // With a null pen GDI leaves out the right and bottom edge; extend by one.
+        let _ = RoundRect(
+            dc,
+            rect.left,
+            rect.top,
+            rect.right + 1,
+            rect.bottom + 1,
+            radius,
+            radius,
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+fn fill_ellipse(dc: HDC, rect: RECT, color: Rgb) {
+    unsafe {
+        let brush = CreateSolidBrush(colorref(color));
+        let old_brush = SelectObject(dc, brush.into());
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        let _ = Ellipse(dc, rect.left, rect.top, rect.right + 1, rect.bottom + 1);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+fn draw_polyline(dc: HDC, points: &[POINT], color: Rgb, width: i32) {
+    if points.len() < 2 {
+        return;
+    }
+    unsafe {
+        let pen = if width <= 1 {
+            CreatePen(PS_SOLID, 1, colorref(color))
+        } else {
+            let brush = LOGBRUSH {
+                lbStyle: BS_SOLID,
+                lbColor: colorref(color),
+                lbHatch: 0,
+            };
+            ExtCreatePen(
+                PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+                width as u32,
+                &brush,
+                None,
+            )
+        };
+        let old = SelectObject(dc, pen.into());
+        let _ = Polyline(dc, points);
+        SelectObject(dc, old);
+        let _ = DeleteObject(pen.into());
     }
 }
 
@@ -1156,16 +1576,20 @@ mod tests {
     fn long_errors_keep_the_card_bounded_and_offer_full_details() {
         let mut snapshot = ProviderSnapshot::empty(Provider::Claude);
         snapshot.error = Some("Missing login. ".repeat(100));
-        assert_eq!(provider_height(&snapshot), 91);
+        let card_chrome = CARD_PAD_TOP + CARD_HEADER_HEIGHT + CARD_PAD_BOTTOM + CARD_GAP;
+        assert_eq!(provider_height(&snapshot), card_chrome + MESSAGE_ROW_HEIGHT);
         let summary = error_summary(snapshot.error.as_ref().unwrap());
         assert!(summary.len() < 110);
         assert!(summary.ends_with("Click for details."));
         snapshot.session = Some(UsageWindow::new("Session", 10.0, None));
-        assert_eq!(provider_height(&snapshot), 143);
+        assert_eq!(
+            provider_height(&snapshot),
+            card_chrome + WINDOW_ROW_HEIGHT + MESSAGE_ROW_HEIGHT
+        );
     }
 
     #[test]
-    fn model_usage_window_adds_room_for_a_separate_bar() {
+    fn model_usage_windows_share_one_row_of_pills() {
         let mut snapshot = ProviderSnapshot::empty(Provider::Claude);
         snapshot.session = Some(UsageWindow::new("Session", 10.0, None));
         snapshot.weekly = Some(UsageWindow::new("Weekly", 20.0, None));
@@ -1174,8 +1598,18 @@ mod tests {
         snapshot
             .model_windows
             .push(UsageWindow::new("Fable 5", 30.0, None));
+        assert_eq!(
+            provider_height(&snapshot),
+            without_model_window + MODEL_ROW_HEIGHT
+        );
 
-        assert_eq!(provider_height(&snapshot), without_model_window + 36);
+        snapshot
+            .model_windows
+            .push(UsageWindow::new("Sonnet", 30.0, None));
+        assert_eq!(
+            provider_height(&snapshot),
+            without_model_window + MODEL_ROW_HEIGHT
+        );
     }
 
     #[test]

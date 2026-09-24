@@ -325,6 +325,7 @@ fn to_usage_window(window: RawWindow, fallback_label: &str) -> UsageWindow {
         None => fallback_label.to_string(),
     };
     UsageWindow::new(label, window.used_percent, window.resets_at_unix)
+        .with_duration_secs(window.duration_minutes.map(|minutes| minutes * 60))
 }
 
 #[cfg(test)]

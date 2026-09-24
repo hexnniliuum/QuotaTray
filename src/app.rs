@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -30,6 +30,19 @@ pub struct SharedState {
     pub start_with_windows: AtomicBool,
     visible_providers: AtomicU8,
     pub icon_handles: Mutex<[Option<isize>; Provider::COUNT]>,
+    pulse: Mutex<Option<Pulse>>,
+    /// Counts refreshes as they start, so the UI can tell a new one from the
+    /// one it already animated even when update messages coalesce.
+    pub refresh_generation: AtomicU64,
+    /// The refresh generation the dashboard last animated.
+    pub pulsed_generation: AtomicU64,
+}
+
+/// A running refresh trace on the dashboard.
+#[derive(Clone, Copy, Debug)]
+pub struct Pulse {
+    pub started: Instant,
+    pub seed: u64,
 }
 
 impl SharedState {
@@ -50,6 +63,9 @@ impl SharedState {
             start_with_windows: AtomicBool::new(false),
             visible_providers: AtomicU8::new(visibility::load()),
             icon_handles: Mutex::new([None; Provider::COUNT]),
+            pulse: Mutex::new(None),
+            refresh_generation: AtomicU64::new(0),
+            pulsed_generation: AtomicU64::new(0),
         });
         (state, refresh_rx)
     }
@@ -67,7 +83,8 @@ impl SharedState {
     }
 
     pub fn set_dashboard_window(&self, hwnd: HWND) {
-        self.dashboard_hwnd.store(hwnd.0 as isize, Ordering::Relaxed);
+        self.dashboard_hwnd
+            .store(hwnd.0 as isize, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self, provider: Provider) -> ProviderSnapshot {
@@ -90,6 +107,25 @@ impl SharedState {
         let _ = self.refresh_tx.send(RefreshCommand::Quit);
     }
 
+    pub fn start_pulse(&self) {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(1);
+        *self.pulse.lock().unwrap() = Some(Pulse {
+            started: Instant::now(),
+            seed,
+        });
+    }
+
+    pub fn pulse(&self) -> Option<Pulse> {
+        *self.pulse.lock().unwrap()
+    }
+
+    pub fn clear_pulse(&self) {
+        *self.pulse.lock().unwrap() = None;
+    }
+
     pub fn is_provider_visible(&self, provider: Provider) -> bool {
         self.visible_providers.load(Ordering::Relaxed) & (1 << provider.index()) != 0
     }
@@ -109,10 +145,7 @@ impl SharedState {
     }
 
     fn refresh_usage(&self, provider: Provider, previous_config: &mut Option<ProviderSettings>) {
-        diagnostics::event(
-            "INFO",
-            &format!("refreshing {} usage", provider.name()),
-        );
+        diagnostics::event("INFO", &format!("refreshing {} usage", provider.name()));
         let result = self.read_usage(provider, previous_config);
         let mut snapshots = self.snapshots.lock().unwrap();
         let target = &mut snapshots[provider.index()];
@@ -208,7 +241,7 @@ impl SharedState {
 
 fn window(handle: &AtomicIsize) -> Option<HWND> {
     let value = handle.load(Ordering::Relaxed);
-    (value != 0).then(|| HWND(value as *mut _))
+    (value != 0).then_some(HWND(value as *mut _))
 }
 
 pub fn start_refresh_worker(state: Arc<SharedState>, receiver: mpsc::Receiver<RefreshCommand>) {
@@ -229,6 +262,7 @@ pub fn start_refresh_worker(state: Arc<SharedState>, receiver: mpsc::Receiver<Re
                     "usage-only"
                 };
                 diagnostics::event("INFO", &format!("{kind} refresh started"));
+                state.refresh_generation.fetch_add(1, Ordering::Relaxed);
                 state.refreshing.store(true, Ordering::Relaxed);
                 state.notify_ui();
                 for provider in Provider::ALL {

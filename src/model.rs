@@ -83,6 +83,7 @@ pub struct UsageWindow {
     pub label: String,
     pub used_percent: f64,
     pub resets_at_unix: Option<i64>,
+    pub duration_secs: Option<i64>,
 }
 
 impl UsageWindow {
@@ -91,11 +92,26 @@ impl UsageWindow {
             label: label.into(),
             used_percent: used_percent.clamp(0.0, 100.0),
             resets_at_unix,
+            duration_secs: None,
         }
+    }
+
+    pub fn with_duration_secs(mut self, duration_secs: Option<i64>) -> Self {
+        self.duration_secs = duration_secs.filter(|secs| *secs > 0);
+        self
     }
 
     pub fn is_applicable(&self, now_unix: i64) -> bool {
         self.resets_at_unix.is_none_or(|reset| reset > now_unix)
+    }
+
+    /// How much of the window has passed, when both its reset time and
+    /// length are known.
+    pub fn elapsed_percent(&self, now_unix: i64) -> Option<f64> {
+        let reset = self.resets_at_unix?;
+        let duration = self.duration_secs.filter(|secs| *secs > 0)?;
+        let elapsed = now_unix - (reset - duration);
+        Some((elapsed as f64 / duration as f64 * 100.0).clamp(0.0, 100.0))
     }
 }
 
@@ -125,14 +141,6 @@ impl ExtraUsageBudget {
     pub fn remaining_minor(&self) -> Option<i64> {
         self.limit_minor
             .map(|limit| limit.saturating_sub(self.used_minor).max(0))
-    }
-
-    pub fn used_percent(&self) -> Option<f64> {
-        let limit = self.limit_minor?;
-        if limit == 0 {
-            return Some(if self.used_minor == 0 { 0.0 } else { 100.0 });
-        }
-        Some((self.used_minor as f64 / limit as f64 * 100.0).clamp(0.0, 100.0))
     }
 
     pub fn format_amount(&self, amount_minor: i64) -> String {
@@ -184,7 +192,10 @@ impl ProviderSnapshot {
     pub fn freshness_label(&self, now_unix: i64) -> String {
         match (self.from_session_history, self.last_updated_unix) {
             (true, Some(updated)) => {
-                format!("Saved session usage · recorded {}", age_label(updated, now_unix))
+                format!(
+                    "Saved session usage · recorded {}",
+                    age_label(updated, now_unix)
+                )
             }
             (true, None) => "Saved session usage · recording time unknown".to_string(),
             (false, Some(updated)) => format!("Updated {}", age_label(updated, now_unix)),
@@ -319,11 +330,35 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_percent_needs_both_reset_and_duration() {
+        let window =
+            UsageWindow::new("Session", 10.0, Some(4_000)).with_duration_secs(Some(10_000));
+        assert_eq!(window.elapsed_percent(1_000), Some(70.0));
+        assert_eq!(window.elapsed_percent(-9_000), Some(0.0));
+        assert_eq!(window.elapsed_percent(9_000), Some(100.0));
+        assert_eq!(
+            UsageWindow::new("Session", 10.0, Some(4_000)).elapsed_percent(1_000),
+            None
+        );
+        assert_eq!(
+            UsageWindow::new("Session", 10.0, None)
+                .with_duration_secs(Some(10))
+                .elapsed_percent(1_000),
+            None
+        );
+        assert_eq!(
+            UsageWindow::new("Session", 10.0, Some(4_000))
+                .with_duration_secs(Some(0))
+                .duration_secs,
+            None
+        );
+    }
+
+    #[test]
     fn extra_usage_calculates_and_formats_remaining_budget() {
         let budget = ExtraUsageBudget::new(7_426, Some(10_000), "EUR", 2);
 
         assert_eq!(budget.remaining_minor(), Some(2_574));
-        assert_eq!(budget.used_percent(), Some(74.26));
         assert_eq!(budget.format_amount(2_574), "€25.74");
     }
 
@@ -332,7 +367,6 @@ mod tests {
         let budget = ExtraUsageBudget::new(12_000, Some(10_000), "USD", 2);
 
         assert_eq!(budget.remaining_minor(), Some(0));
-        assert_eq!(budget.used_percent(), Some(100.0));
     }
 
     #[test]

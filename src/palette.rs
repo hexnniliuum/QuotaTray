@@ -4,9 +4,32 @@ use crate::model::{Provider, ServiceStatusLevel};
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 pub const BACKGROUND: Rgb = Rgb(28, 28, 30);
+pub const CARD: Rgb = Rgb(36, 36, 38);
+pub const CARD_RULE: Rgb = Rgb(49, 49, 51);
+pub const PILL: Rgb = Rgb(49, 49, 51);
+pub const BUTTON: Rgb = Rgb(46, 46, 48);
+pub const CHIP: Rgb = Rgb(42, 42, 44);
 pub const TRACK: Rgb = Rgb(70, 70, 74);
+pub const ELAPSED: Rgb = Rgb(154, 154, 163);
 pub const TEXT: Rgb = Rgb(255, 255, 255);
+pub const SOFT_TEXT: Rgb = Rgb(208, 208, 213);
 pub const MUTED_TEXT: Rgb = Rgb(166, 166, 172);
+pub const DIM_TEXT: Rgb = Rgb(142, 142, 147);
+pub const OFF_TEXT: Rgb = Rgb(110, 110, 115);
+pub const TRACE_HEAD: Rgb = Rgb(255, 255, 255);
+
+/// Mixes `amount` of `foreground` into `background`.
+pub fn blend(background: Rgb, foreground: Rgb, amount: f64) -> Rgb {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel = |back: u8, front: u8| {
+        (f64::from(back) + (f64::from(front) - f64::from(back)) * amount).round() as u8
+    };
+    Rgb(
+        channel(background.0, foreground.0),
+        channel(background.1, foreground.1),
+        channel(background.2, foreground.2),
+    )
+}
 
 pub fn service_status_color(level: ServiceStatusLevel) -> Rgb {
     match level {
@@ -50,6 +73,23 @@ mod tests {
         assert_eq!(usage_color(Provider::Codex, 20.0), Rgb(59, 130, 246));
         assert_eq!(usage_color(Provider::Codex, 75.0), Rgb(250, 204, 21));
         assert_eq!(usage_color(Provider::Codex, 95.0), Rgb(239, 68, 68));
+    }
+
+    #[test]
+    fn blend_moves_between_the_two_colors() {
+        assert_eq!(blend(Rgb(0, 0, 0), Rgb(255, 255, 255), 0.0), Rgb(0, 0, 0));
+        assert_eq!(
+            blend(Rgb(0, 0, 0), Rgb(255, 255, 255), 1.0),
+            Rgb(255, 255, 255)
+        );
+        assert_eq!(
+            blend(Rgb(0, 100, 200), Rgb(100, 100, 0), 0.5),
+            Rgb(50, 100, 100)
+        );
+        assert_eq!(
+            blend(Rgb(0, 0, 0), Rgb(255, 255, 255), 2.0),
+            Rgb(255, 255, 255)
+        );
     }
 
     #[test]
