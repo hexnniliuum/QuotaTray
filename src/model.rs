@@ -259,7 +259,7 @@ pub fn format_countdown(reset_unix: Option<i64>, now_unix: i64) -> String {
         return "reset unknown".to_string();
     };
     let remaining = reset.saturating_sub(now_unix);
-    if remaining == 0 {
+    if remaining <= 0 {
         return "reset due".to_string();
     }
     let days = remaining / 86_400;
@@ -310,6 +310,14 @@ fn format_money(amount_minor: i64, currency: &str, decimal_places: u32) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn countdown_handles_before_at_and_after_reset() {
+        assert_eq!(format_countdown(Some(1_000), 999), "resets in 1m");
+        assert_eq!(format_countdown(Some(1_000), 1_000), "reset due");
+        assert_eq!(format_countdown(Some(1_000), 1_001), "reset due");
+        assert_eq!(format_countdown(None, 1_001), "reset unknown");
+    }
 
     #[test]
     fn session_is_preferred_even_when_weekly_is_higher() {

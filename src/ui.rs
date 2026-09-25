@@ -5,8 +5,8 @@ mod layout;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::ptr::null_mut;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -41,6 +41,8 @@ use drawing::{
 use layout::{CardLayout, CardRow};
 
 const WM_TRAY: u32 = 0x8002;
+static WM_TASKBAR_CREATED: LazyLock<u32> =
+    LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
 const TRAY_CLASS: PCWSTR = w!("QuotaTray.MessageWindow");
 const DASHBOARD_CLASS: PCWSTR = w!("QuotaTray.DashboardWindow");
 const DASHBOARD_WIDTH: i32 = 380;
@@ -154,7 +156,7 @@ pub fn run(state: Arc<SharedState>) -> windows::core::Result<()> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(instance),
             Some((&state as *const Arc<SharedState>).cast()),
@@ -240,6 +242,15 @@ unsafe extern "system" fn tray_proc(
                         resize_dashboard_to_content(dashboard, state);
                         let _ = InvalidateRect(Some(dashboard), None, false);
                     };
+                }
+            }
+            LRESULT(0)
+        }
+        message if message != 0 && message == *WM_TASKBAR_CREATED => {
+            if let Some(state) = state_from_window(hwnd) {
+                unsafe {
+                    remove_tray_icons(hwnd, state);
+                    update_tray_icons(hwnd, state);
                 }
             }
             LRESULT(0)
@@ -366,6 +377,9 @@ unsafe extern "system" fn dashboard_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            if let Some(state) = state_from_window(hwnd) {
+                state.set_dashboard_window(HWND::default());
+            }
             detach_window_state(hwnd);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
@@ -526,7 +540,9 @@ unsafe fn update_tray_icons(hwnd: HWND, state: &SharedState) {
                 NIM_ADD
             };
             unsafe {
-                let _ = Shell_NotifyIconW(operation, &data);
+                if !Shell_NotifyIconW(operation, &data).as_bool() && operation == NIM_MODIFY {
+                    let _ = Shell_NotifyIconW(NIM_ADD, &data);
+                }
             };
             if let Some(previous) = handles[index].replace(icon.0 as isize) {
                 unsafe { DestroyIcon(HICON(previous as *mut _)).ok() };

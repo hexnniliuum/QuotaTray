@@ -196,8 +196,8 @@ fn parse_camel_window(value: &Value) -> Option<RawWindow> {
 }
 
 fn read_from_session_files(root: &Path) -> Result<ProviderSnapshot, String> {
-    let mut files = recent_session_files(root);
-    files.sort_by_key(|path| {
+    let mut files = session_files(root);
+    files.sort_by_cached_key(|path| {
         fs::metadata(path)
             .and_then(|metadata| metadata.modified())
             .ok()
@@ -249,11 +249,11 @@ fn parse_session_content(content: &str) -> Option<ProviderSnapshot> {
     None
 }
 
-fn recent_session_files(root: &Path) -> Vec<PathBuf> {
+fn session_files(root: &Path) -> Vec<PathBuf> {
     let mut output = Vec::new();
-    for year in sorted_subdirectories(root).into_iter().rev().take(2) {
-        for month in sorted_subdirectories(&year).into_iter().rev().take(2) {
-            for day in sorted_subdirectories(&month).into_iter().rev().take(3) {
+    for year in subdirectories(root) {
+        for month in subdirectories(&year) {
+            for day in subdirectories(&month) {
                 let Ok(entries) = fs::read_dir(day) else {
                     continue;
                 };
@@ -270,16 +270,14 @@ fn recent_session_files(root: &Path) -> Vec<PathBuf> {
     output
 }
 
-fn sorted_subdirectories(root: &Path) -> Vec<PathBuf> {
-    let mut directories = fs::read_dir(root)
+fn subdirectories(root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    directories.sort();
-    directories
+        .collect()
 }
 
 fn parse_snake_window(value: &Value) -> Option<RawWindow> {
@@ -382,6 +380,54 @@ Start-Sleep -Seconds 30
         fs::remove_dir(day.parent().unwrap()).unwrap();
         fs::remove_dir(root.join("2026")).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn session_fallback_finds_resumed_sessions_in_older_directories() {
+        let root = std::env::temp_dir().join(format!("quota-tray-resumed-{}", std::process::id()));
+        for directory in [
+            "2024/01/01",
+            "2024/01/02",
+            "2024/01/03",
+            "2024/01/04",
+            "2024/02/01",
+            "2024/03/01",
+            "2025/01/01",
+            "2026/01/01",
+        ] {
+            let day = root.join(directory);
+            fs::create_dir_all(&day).unwrap();
+            let file = day.join("rollout-synthetic.jsonl");
+            fs::write(
+                &file,
+                json!({
+                    "type": "token_count",
+                    "rate_limits": {"primary": {"used_percent": 10, "window_minutes": 300}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000))
+                .unwrap();
+        }
+        fs::write(
+            root.join("2024/01/01/rollout-synthetic.jsonl"),
+            json!({
+                "type": "token_count",
+                "rate_limits": {"primary": {"used_percent": 37, "window_minutes": 300}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let result = read_from_session_files(&root);
+        fs::remove_dir_all(&root).unwrap();
+        let snapshot = result.unwrap();
+        assert_eq!(snapshot.session.unwrap().used_percent, 37.0);
+        assert!(snapshot.from_session_history);
     }
 
     #[test]
