@@ -26,7 +26,7 @@ use crate::model::{
     ExtraUsageBudget, Provider, ProviderSnapshot, ServiceStatus, ServiceStatusLevel, UsageWindow,
     format_countdown, now_unix,
 };
-use crate::palette::{self, Rgb, UsageColors, blend};
+use crate::palette::{self, Rgb, TrayTheme, UsageColors, blend};
 use crate::pulse::{self, Frame, Trace};
 use crate::settings::{self, Settings, Source};
 use crate::startup;
@@ -60,9 +60,14 @@ const MENU_ADVANCED_SETTINGS: usize = MENU_SOURCE_BASE + Provider::COUNT * Sourc
 #[derive(Clone, Copy)]
 struct Layout {
     scale: f32,
+    theme: TrayTheme,
 }
 
 impl Layout {
+    fn colors(self) -> palette::DashboardColors {
+        self.theme.dashboard()
+    }
+
     fn px(self, value: i32) -> i32 {
         (value as f32 * self.scale).round() as i32
     }
@@ -109,6 +114,10 @@ impl DashboardMetrics {
 
     fn refresh_rect(self, layout: Layout) -> RECT {
         layout.rect(292, 16, CONTENT_RIGHT, 44)
+    }
+
+    fn theme_rect(self, layout: Layout) -> RECT {
+        layout.rect(252, 16, 280, 44)
     }
 
     fn startup_rect(self, layout: Layout) -> RECT {
@@ -338,6 +347,13 @@ unsafe extern "system" fn dashboard_proc(
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         };
                     }
+                } else if point_in_rect(x, y, metrics.theme_rect(layout)) {
+                    if let Err(error) = state.toggle_tray_theme() {
+                        crate::show_error(&error);
+                    }
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 } else if point_in_rect(x, y, metrics.sources_rect(layout)) {
                     if let Err(error) = show_sources_menu(hwnd, state) {
                         crate::show_error(&error);
@@ -495,6 +511,7 @@ unsafe fn update_tray_icons(hwnd: HWND, state: &SharedState) {
                 state.snapshot(provider),
                 state.service_status(provider),
                 state.usage_colors(provider),
+                state.tray_theme(),
             );
             let data = notification_data(hwnd, index as u32 + 1, icon, &tooltip);
             let operation = if handles[index].is_some() {
@@ -560,6 +577,7 @@ fn create_usage_icon_and_tip(
     snapshot: ProviderSnapshot,
     service_status: ServiceStatus,
     colors: UsageColors,
+    theme: TrayTheme,
 ) -> (HICON, String) {
     let now = now_unix();
     let displayed = snapshot.displayed_window(now);
@@ -567,8 +585,8 @@ fn create_usage_icon_and_tip(
         .map(|window| format!("{:.0}", window.used_percent))
         .unwrap_or_else(|| "--".to_string());
     let color = displayed
-        .map(|window| colors.at(window.used_percent))
-        .unwrap_or(palette::TRACK);
+        .map(|window| theme.usage_color(colors.at(window.used_percent)))
+        .unwrap_or(theme.track());
     let tooltip = if let Some(window) = displayed {
         format!(
             "{} · {} · {} {:.0}% · {}",
@@ -591,6 +609,7 @@ fn create_usage_icon_and_tip(
             displayed.map_or(0.0, |window| window.used_percent),
             color,
             service_status.level,
+            theme,
         ),
         tooltip,
     )
@@ -601,6 +620,7 @@ fn create_circle_icon(
     percentage: f64,
     color: Rgb,
     service_status: ServiceStatusLevel,
+    theme: TrayTheme,
 ) -> HICON {
     const SIZE: i32 = 64;
     unsafe {
@@ -626,12 +646,12 @@ fn create_circle_icon(
             return HICON::default();
         }
         let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (SIZE * SIZE) as usize);
-        render_circle_pixels(pixels, SIZE, percentage, color, service_status);
+        render_circle_pixels(pixels, SIZE, percentage, color, service_status, theme);
 
         let dc = CreateCompatibleDC(None);
         let old_bitmap = SelectObject(dc, color_bitmap.into());
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, colorref(Rgb(255, 255, 255)));
+        SetTextColor(dc, colorref(theme.text()));
         let font_height = if text.len() >= 3 { -24 } else { -31 };
         let font = CreateFontW(
             font_height,
@@ -694,6 +714,7 @@ fn render_circle_pixels(
     percentage: f64,
     color: Rgb,
     service_status: ServiceStatusLevel,
+    theme: TrayTheme,
 ) {
     let center = (size as f64 - 1.0) / 2.0;
     let ring_outer = size as f64 * 0.50;
@@ -707,13 +728,13 @@ fn render_circle_pixels(
             let dy = y as f64 - center;
             let distance = (dx * dx + dy * dy).sqrt();
             let pixel = if distance <= ring_inner {
-                let background = glow.map_or(palette::BACKGROUND, |(glow_color, strength)| {
+                let background = glow.map_or(theme.background(), |(glow_color, strength)| {
                     if distance <= glow_inner {
-                        palette::BACKGROUND
+                        theme.background()
                     } else {
                         let progress = (distance - glow_inner) / (ring_inner - glow_inner);
                         blend(
-                            palette::BACKGROUND,
+                            theme.background(),
                             glow_color,
                             strength * progress.powf(1.35),
                         )
@@ -725,7 +746,7 @@ fn render_circle_pixels(
                 bgra(if angle <= fill_angle {
                     color
                 } else {
-                    palette::TRACK
+                    theme.track()
                 })
             } else {
                 0
@@ -812,6 +833,7 @@ unsafe fn toggle_dashboard(owner: HWND, state: &SharedState) {
     };
     let layout = Layout {
         scale: dpi.max(96) as f32 / 96.0,
+        theme: state.tray_theme(),
     };
     let metrics = DashboardMetrics::from_state(state);
     let width = layout.px(DASHBOARD_WIDTH);
@@ -924,7 +946,7 @@ unsafe fn paint_dashboard(hwnd: HWND, state: &SharedState) {
 fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> bool {
     let layout = layout_for_window(hwnd);
     let metrics = DashboardMetrics::from_state(state);
-    fill_rect(dc, client, palette::BACKGROUND);
+    fill_rect(dc, client, layout.colors().background);
     unsafe { SetBkMode(dc, TRANSPARENT) };
 
     draw_text(
@@ -933,7 +955,7 @@ fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> b
         layout.rect(CONTENT_LEFT, 16, 200, 44),
         "Usage",
         Font::semibold(17),
-        palette::TEXT,
+        layout.colors().text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     let refreshing = state.refreshing.load(Ordering::Relaxed);
@@ -941,6 +963,17 @@ fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> b
         dc,
         metrics.refresh_rect(layout),
         if refreshing { "Working…" } else { "Refresh" },
+        layout,
+    );
+
+    draw_button(
+        dc,
+        metrics.theme_rect(layout),
+        if state.tray_theme() == TrayTheme::Dark {
+            "☀"
+        } else {
+            "☾"
+        },
         layout,
     );
 
@@ -993,7 +1026,7 @@ fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> b
             rect,
             label,
             Font::regular(11),
-            palette::MUTED_TEXT,
+            layout.colors().muted_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
     }
@@ -1015,7 +1048,7 @@ fn paint_provider(
         dc,
         layout.rect(CONTENT_LEFT, top, CONTENT_RIGHT, card_bottom),
         layout.px(CARD_RADIUS),
-        palette::CARD,
+        layout.colors().card,
     );
 
     let header_top = top + CARD_PAD_TOP;
@@ -1029,7 +1062,7 @@ fn paint_provider(
         header_rect(CARD_LEFT, CARD_LEFT + name_width + 4),
         snapshot.provider.name(),
         Font::bold(14),
-        palette::TEXT,
+        layout.colors().text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     let dot_left = CARD_LEFT + name_width + 8;
@@ -1037,7 +1070,9 @@ fn paint_provider(
     fill_ellipse(
         dc,
         layout.rect(dot_left, dot_top, dot_left + 6, dot_top + 6),
-        palette::service_status_color(service_status.level),
+        layout
+            .theme
+            .dashboard_usage_color(palette::service_status_color(service_status.level)),
     );
     draw_text(
         dc,
@@ -1045,7 +1080,7 @@ fn paint_provider(
         header_rect(dot_left + 11, 250),
         service_status.label(),
         Font::regular(11),
-        palette::MUTED_TEXT,
+        layout.colors().muted_text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     if !snapshot.from_session_history {
@@ -1059,7 +1094,7 @@ fn paint_provider(
                 snapshot.freshness_label(now)
             },
             Font::regular(11),
-            palette::DIM_TEXT,
+            layout.colors().dim_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
     }
@@ -1072,7 +1107,7 @@ fn paint_provider(
             layout.rect(CARD_LEFT, row_top, CARD_RIGHT, row_top + HISTORY_ROW_HEIGHT),
             &snapshot.freshness_label(now),
             Font::regular(11),
-            palette::DIM_TEXT,
+            layout.colors().dim_text,
             DT_LEFT | DT_SINGLELINE,
         );
         row_top += HISTORY_ROW_HEIGHT;
@@ -1110,7 +1145,7 @@ fn paint_provider(
             ),
             &message,
             Font::regular(12),
-            palette::MUTED_TEXT,
+            layout.colors().muted_text,
             DT_LEFT | DT_WORDBREAK,
         );
     }
@@ -1134,26 +1169,26 @@ fn paint_window_row(
     } else {
         "Expired window"
     };
-    let color = colors.at(percentage);
+    let color = layout.theme.dashboard_usage_color(colors.at(percentage));
     draw_text(
         dc,
         layout,
         layout.rect(CARD_LEFT, top + 4, BARS_RIGHT, top + 20),
         label,
         Font::regular(12),
-        palette::TEXT,
+        layout.colors().text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     let track = layout.rect(CARD_LEFT, top + 25, BARS_RIGHT, top + 30);
-    let fill_end = paint_meter(dc, track, percentage, color, palette::CARD);
+    let fill_end = paint_meter(dc, track, percentage, color, layout.colors().card);
     if let Some(elapsed) = window.elapsed_percent(now).filter(|_| applicable) {
         let elapsed_track = layout.rect(CARD_LEFT, top + 34, BARS_RIGHT, top + 36);
         paint_meter(
             dc,
             elapsed_track,
             elapsed,
-            blend(palette::CARD, palette::ELAPSED, 0.5),
-            palette::CARD,
+            blend(layout.colors().card, layout.colors().elapsed, 0.5),
+            layout.colors().card,
         );
     }
     draw_text(
@@ -1162,7 +1197,7 @@ fn paint_window_row(
         layout.rect(BARS_RIGHT + 12, top + 18, BARS_RIGHT + 56, top + 34),
         &format!("{:.0}%", percentage),
         Font::bold(13),
-        palette::TEXT,
+        layout.colors().text,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
     let countdown = format_countdown(window.resets_at_unix, now);
@@ -1177,7 +1212,7 @@ fn paint_window_row(
         layout.rect(BARS_RIGHT + 68, top + 20, CARD_RIGHT, top + 34),
         countdown,
         Font::regular(11),
-        palette::DIM_TEXT,
+        layout.colors().dim_text,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
     paint_trace(dc, track, fill_end, color, layout, cursor);
@@ -1238,13 +1273,13 @@ fn paint_trace(
     draw_polyline(
         dc,
         &to_device(&frame.trail),
-        blend(palette::CARD, color, 0.55 * frame.trail_opacity),
+        blend(layout.colors().card, color, 0.55 * frame.trail_opacity),
         1,
     );
     draw_polyline(
         dc,
         &to_device(&frame.head),
-        palette::TRACE_HEAD,
+        layout.colors().trace_head,
         ((1.5 * scale) as i32).max(1),
     );
 }
@@ -1268,23 +1303,23 @@ fn paint_model_pills(
             break;
         }
         let pill = layout.rect(left, top + 2, right, top + 26);
-        fill_round_rect(dc, pill, layout.px(6), palette::PILL);
+        fill_round_rect(dc, pill, layout.px(6), layout.colors().pill);
         draw_text(
             dc,
             layout,
             layout.rect(left, top + 2, right, top + 24),
             &text,
             Font::regular(11),
-            palette::SOFT_TEXT,
+            layout.colors().soft_text,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
-        let color = colors.at(percentage);
+        let color = layout.theme.dashboard_usage_color(colors.at(percentage));
         paint_meter(
             dc,
             layout.rect(left + 4, top + 24, right - 4, top + 26),
             percentage,
             color,
-            palette::PILL,
+            layout.colors().pill,
         );
         left = right + 6;
     }
@@ -1294,7 +1329,7 @@ fn paint_extra_usage(dc: HDC, budget: &ExtraUsageBudget, top: i32, layout: Layou
     fill_rect(
         dc,
         layout.rect(CARD_LEFT, top + 2, CARD_RIGHT, top + 3),
-        palette::CARD_RULE,
+        layout.colors().card_rule,
     );
     let text_rect = |left: i32, right: i32| layout.rect(left, top + 9, right, top + 27);
     draw_text(
@@ -1303,7 +1338,7 @@ fn paint_extra_usage(dc: HDC, budget: &ExtraUsageBudget, top: i32, layout: Layou
         text_rect(CARD_LEFT, 180),
         "Extra usage",
         Font::regular(11),
-        palette::DIM_TEXT,
+        layout.colors().dim_text,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
     );
     let (amount, suffix) = match budget.remaining_minor().zip(budget.limit_minor) {
@@ -1323,7 +1358,7 @@ fn paint_extra_usage(dc: HDC, budget: &ExtraUsageBudget, top: i32, layout: Layou
         text_rect(180, CARD_RIGHT),
         &suffix,
         Font::regular(11),
-        palette::DIM_TEXT,
+        layout.colors().dim_text,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
     draw_text(
@@ -1332,26 +1367,26 @@ fn paint_extra_usage(dc: HDC, budget: &ExtraUsageBudget, top: i32, layout: Layou
         text_rect(180, CARD_RIGHT - suffix_width),
         &amount,
         Font::semibold(11),
-        palette::TEXT,
+        layout.colors().text,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
     );
 }
 
 fn draw_button(dc: HDC, rect: RECT, label: &str, layout: Layout) {
-    fill_round_rect(dc, rect, layout.px(6), palette::BUTTON);
+    fill_round_rect(dc, rect, layout.px(6), layout.colors().button);
     draw_text(
         dc,
         layout,
         rect,
         label,
         Font::regular(12),
-        palette::TEXT,
+        layout.colors().text,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
 }
 
 fn draw_chip(dc: HDC, layout: Layout, rect: RECT, label: &str, on: bool) {
-    fill_round_rect(dc, rect, rect.bottom - rect.top, palette::CHIP);
+    fill_round_rect(dc, rect, rect.bottom - rect.top, layout.colors().chip);
     let font = Font::regular(11);
     draw_text(
         dc,
@@ -1360,9 +1395,9 @@ fn draw_chip(dc: HDC, layout: Layout, rect: RECT, label: &str, on: bool) {
         label,
         if on { font } else { font.strikeout() },
         if on {
-            palette::SOFT_TEXT
+            layout.colors().soft_text
         } else {
-            palette::OFF_TEXT
+            layout.colors().off_text
         },
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
@@ -1543,6 +1578,9 @@ fn layout_for_window(hwnd: HWND) -> Layout {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     Layout {
         scale: dpi as f32 / 96.0,
+        theme: state_from_window(hwnd)
+            .map(SharedState::tray_theme)
+            .unwrap_or_default(),
     }
 }
 
@@ -1621,9 +1659,27 @@ mod tests {
             50.0,
             Rgb(255, 255, 255),
             ServiceStatusLevel::Operational,
+            TrayTheme::Dark,
         );
 
         assert_eq!(pixels[32 * 64 + 54], bgra(palette::BACKGROUND));
+    }
+
+    #[test]
+    fn light_tray_uses_light_background_and_track_without_changing_ring_or_transparency() {
+        let theme = TrayTheme::Light;
+        let color = theme.usage_color(UsageColors::for_provider(Provider::Codex).normal);
+        for status in [
+            ServiceStatusLevel::Operational,
+            ServiceStatusLevel::MajorOutage,
+        ] {
+            let mut pixels = vec![0; 64 * 64];
+            render_circle_pixels(&mut pixels, 64, 50.0, color, status, theme);
+            assert_eq!(pixels[32 * 64 + 32], bgra(theme.background()));
+            assert_eq!(pixels[32 * 64 + 58], bgra(color));
+            assert_eq!(pixels[32 * 64 + 5], bgra(theme.track()));
+            assert_eq!(pixels[0], 0);
+        }
     }
 
     #[test]
@@ -1635,6 +1691,7 @@ mod tests {
             50.0,
             Rgb(255, 255, 255),
             ServiceStatusLevel::PartialOutage,
+            TrayTheme::Dark,
         );
 
         assert_eq!(pixels[32 * 64 + 32], bgra(palette::BACKGROUND));
@@ -1653,6 +1710,7 @@ mod tests {
             50.0,
             Rgb(255, 255, 255),
             ServiceStatusLevel::PartialOutage,
+            TrayTheme::Dark,
         );
         render_circle_pixels(
             &mut major,
@@ -1660,6 +1718,7 @@ mod tests {
             50.0,
             Rgb(255, 255, 255),
             ServiceStatusLevel::MajorOutage,
+            TrayTheme::Dark,
         );
 
         let background = rgb(bgra(palette::BACKGROUND));
@@ -1677,6 +1736,7 @@ mod tests {
             100.0,
             usage_color,
             ServiceStatusLevel::MajorOutage,
+            TrayTheme::Dark,
         );
 
         assert_eq!(pixels[32 * 64 + 58], bgra(usage_color));

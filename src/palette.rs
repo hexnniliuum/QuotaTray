@@ -3,6 +3,135 @@ use crate::model::{Provider, ServiceStatusLevel};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrayTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl TrayTheme {
+    pub fn dashboard(self) -> DashboardColors {
+        match self {
+            Self::Dark => DashboardColors {
+                background: BACKGROUND,
+                card: CARD,
+                card_rule: CARD_RULE,
+                pill: PILL,
+                button: BUTTON,
+                chip: CHIP,
+                elapsed: ELAPSED,
+                text: TEXT,
+                soft_text: SOFT_TEXT,
+                muted_text: MUTED_TEXT,
+                dim_text: DIM_TEXT,
+                off_text: OFF_TEXT,
+                trace_head: TRACE_HEAD,
+            },
+            Self::Light => DashboardColors {
+                // Tri Repetae cover base: #949576.
+                background: Rgb(148, 149, 118),
+                card: Rgb(177, 178, 150),
+                card_rule: Rgb(133, 135, 104),
+                pill: Rgb(163, 165, 135),
+                button: Rgb(179, 181, 151),
+                chip: Rgb(164, 166, 136),
+                elapsed: Rgb(47, 50, 34),
+                text: Rgb(25, 28, 19),
+                soft_text: Rgb(37, 40, 27),
+                muted_text: Rgb(40, 43, 30),
+                dim_text: Rgb(43, 46, 32),
+                off_text: Rgb(63, 66, 47),
+                trace_head: Rgb(25, 28, 19),
+            },
+        }
+    }
+
+    pub fn dashboard_usage_color(self, color: Rgb) -> Rgb {
+        if self == Self::Dark {
+            return color;
+        }
+        let mut adjusted = self.usage_color(color);
+        let colors = self.dashboard();
+        while contrast(adjusted, blend(colors.pill, adjusted, 0.2)) < 3.0 {
+            adjusted = blend(adjusted, Rgb(0, 0, 0), 0.08);
+        }
+        adjusted
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
+
+    pub fn background(self) -> Rgb {
+        match self {
+            Self::Dark => BACKGROUND,
+            Self::Light => Rgb(245, 245, 247),
+        }
+    }
+
+    pub fn text(self) -> Rgb {
+        match self {
+            Self::Dark => TEXT,
+            Self::Light => Rgb(28, 28, 30),
+        }
+    }
+
+    pub fn track(self) -> Rgb {
+        match self {
+            Self::Dark => TRACK,
+            Self::Light => Rgb(205, 205, 210),
+        }
+    }
+
+    pub fn usage_color(self, color: Rgb) -> Rgb {
+        if self == Self::Dark {
+            return color;
+        }
+        let mut adjusted = color;
+        while contrast(adjusted, self.track()) < 3.0 {
+            adjusted = blend(adjusted, Rgb(0, 0, 0), 0.08);
+        }
+        adjusted
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct DashboardColors {
+    pub background: Rgb,
+    pub card: Rgb,
+    pub card_rule: Rgb,
+    pub pill: Rgb,
+    pub button: Rgb,
+    pub chip: Rgb,
+    pub elapsed: Rgb,
+    pub text: Rgb,
+    pub soft_text: Rgb,
+    pub muted_text: Rgb,
+    pub dim_text: Rgb,
+    pub off_text: Rgb,
+    pub trace_head: Rgb,
+}
+
+fn contrast(a: Rgb, b: Rgb) -> f64 {
+    let luminance = |Rgb(red, green, blue): Rgb| {
+        let linear = |channel: u8| {
+            let value = f64::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UsageColors {
     pub normal: Rgb,
@@ -13,12 +142,12 @@ impl UsageColors {
     pub fn for_provider(provider: Provider) -> Self {
         match provider {
             Provider::Claude => Self {
-                normal: Rgb(222, 134, 89),
-                warning: Rgb(242, 100, 64),
+                normal: Rgb(229, 184, 61),
+                warning: Rgb(255, 69, 31),
             },
             Provider::Codex => Self {
                 normal: Rgb(229, 231, 235),
-                warning: Rgb(241, 107, 141),
+                warning: Rgb(255, 50, 120),
             },
         }
     }
@@ -76,6 +205,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn olive_dashboard_keeps_text_and_usage_readable() {
+        let theme = TrayTheme::Light;
+        let colors = theme.dashboard();
+        for surface in [
+            colors.background,
+            colors.card,
+            colors.pill,
+            colors.button,
+            colors.chip,
+        ] {
+            for text in [
+                colors.text,
+                colors.soft_text,
+                colors.muted_text,
+                colors.dim_text,
+            ] {
+                assert!(contrast(text, surface) >= 4.5);
+            }
+        }
+        for percentage in [20.0, 80.0] {
+            let adjusted = Provider::ALL.map(|provider| {
+                let color = UsageColors::for_provider(provider).at(percentage);
+                assert_eq!(TrayTheme::Dark.dashboard_usage_color(color), color);
+                let color = theme.dashboard_usage_color(color);
+                for surface in [colors.card, colors.pill] {
+                    assert!(contrast(color, blend(surface, color, 0.2)) >= 3.0);
+                }
+                color
+            });
+            assert_ne!(adjusted[0], adjusted[1]);
+        }
+    }
+
+    #[test]
+    fn light_tray_colors_have_contrast_and_preserve_provider_distinction() {
+        let theme = TrayTheme::Light;
+        assert!(contrast(theme.text(), theme.background()) >= 7.0);
+        for percentage in [20.0, 80.0] {
+            let colors = Provider::ALL.map(|provider| {
+                let color = UsageColors::for_provider(provider).at(percentage);
+                assert_eq!(TrayTheme::Dark.usage_color(color), color);
+                let light = theme.usage_color(color);
+                assert!(contrast(light, theme.track()) >= 3.0);
+                assert!(contrast(light, theme.background()) >= 3.0);
+                light
+            });
+            assert_ne!(colors[0], colors[1]);
+        }
+        for color in [Rgb(0, 0, 0), Rgb(255, 255, 255), Rgb(255, 255, 0)] {
+            assert!(contrast(theme.usage_color(color), theme.track()) >= 3.0);
+        }
+    }
+
+    #[test]
     fn provider_palettes_remain_distinct_at_each_threshold() {
         for percentage in [20.0, 75.0, 79.9, 80.0, 95.0] {
             let colors =
@@ -89,7 +272,7 @@ mod tests {
         for percentage in [20.0, 75.0, 79.9] {
             assert_eq!(
                 UsageColors::for_provider(Provider::Claude).at(percentage),
-                Rgb(222, 134, 89)
+                Rgb(229, 184, 61)
             );
             assert_eq!(
                 UsageColors::for_provider(Provider::Codex).at(percentage),
@@ -99,11 +282,11 @@ mod tests {
         for percentage in [80.0, 95.0, 100.0] {
             assert_eq!(
                 UsageColors::for_provider(Provider::Claude).at(percentage),
-                Rgb(242, 100, 64)
+                Rgb(255, 69, 31)
             );
             assert_eq!(
                 UsageColors::for_provider(Provider::Codex).at(percentage),
-                Rgb(241, 107, 141)
+                Rgb(255, 50, 120)
             );
         }
     }

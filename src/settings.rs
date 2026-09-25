@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::model::Provider;
-use crate::palette::{Rgb, UsageColors};
+use crate::palette::{Rgb, TrayTheme, UsageColors};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Source {
@@ -81,6 +81,7 @@ pub fn default_directory(provider: Provider) -> &'static str {
 
 #[derive(Clone, Debug)]
 pub struct Settings {
+    pub tray_theme: TrayTheme,
     pub providers: [ProviderSettings; Provider::COUNT],
     pub colors: [UsageColors; Provider::COUNT],
 }
@@ -88,6 +89,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            tray_theme: TrayTheme::default(),
             providers: std::array::from_fn(|_| ProviderSettings::default()),
             colors: Provider::ALL.map(UsageColors::for_provider),
         }
@@ -110,13 +112,20 @@ impl Settings {
             serde_json::from_str(content.trim_start_matches('\u{feff}')).map_err(|_| invalid())?;
         let object = root.as_object().ok_or_else(invalid)?;
         if object.keys().any(|key| {
-            Provider::ALL
-                .iter()
-                .all(|provider| provider.key() != key.as_str())
+            key != "tray_theme"
+                && Provider::ALL
+                    .iter()
+                    .all(|provider| provider.key() != key.as_str())
         }) {
             return Err(invalid());
         }
         let mut settings = Self::default();
+        settings.tray_theme = match object.get("tray_theme") {
+            None | Some(Value::Null) => TrayTheme::default(),
+            Some(Value::String(value)) if value == "dark" => TrayTheme::Dark,
+            Some(Value::String(value)) if value == "light" => TrayTheme::Light,
+            _ => return Err("Invalid config.json: tray_theme must be light or dark.".into()),
+        };
         for provider in Provider::ALL {
             let Some(value) = object.get(provider.key()) else {
                 continue;
@@ -210,7 +219,10 @@ impl Settings {
     }
 
     fn to_json(&self) -> Value {
-        let mut root = json!({});
+        let mut root = json!({"tray_theme": match self.tray_theme {
+            TrayTheme::Dark => "dark",
+            TrayTheme::Light => "light",
+        }});
         for provider in Provider::ALL {
             let config = &self.providers[provider.index()];
             let colors = self.colors[provider.index()];
@@ -282,6 +294,18 @@ pub fn try_sources<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_theme_defaults_and_survives_saving_source_settings() {
+        assert_eq!(Settings::parse("{}").unwrap().tray_theme, TrayTheme::Dark);
+        let mut settings = Settings::parse(r#"{"tray_theme":"light"}"#).unwrap();
+        settings.providers[0].source = Source::Wsl;
+        let loaded = Settings::parse(&settings.to_json().to_string()).unwrap();
+        assert_eq!(loaded.tray_theme, TrayTheme::Light);
+        assert_eq!(loaded.providers[0].source, Source::Wsl);
+        assert!(Settings::parse(r#"{"tray_theme":"lgiht"}"#).is_err());
+        assert!(Settings::parse(r#"{"tray_theme":true}"#).is_err());
+    }
 
     #[test]
     fn config_path_migrates_legacy_settings_without_overwriting_new_settings() {

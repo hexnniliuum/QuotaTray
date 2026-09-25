@@ -7,7 +7,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::model::{Provider, ProviderSnapshot, ServiceStatus, ServiceStatusLevel};
-use crate::palette::UsageColors;
+use crate::palette::{TrayTheme, UsageColors};
 use crate::settings::{ProviderSettings, Settings};
 use crate::{diagnostics, providers, service_status, visibility};
 
@@ -25,6 +25,7 @@ pub struct SharedState {
     snapshots: Mutex<[ProviderSnapshot; Provider::COUNT]>,
     service_statuses: Mutex<[ServiceStatus; Provider::COUNT]>,
     colors: Mutex<[UsageColors; Provider::COUNT]>,
+    tray_theme: Mutex<TrayTheme>,
     refresh_tx: mpsc::Sender<RefreshCommand>,
     tray_hwnd: AtomicIsize,
     dashboard_hwnd: AtomicIsize,
@@ -50,6 +51,7 @@ pub struct Pulse {
 impl SharedState {
     pub fn new() -> (Arc<Self>, mpsc::Receiver<RefreshCommand>) {
         let (refresh_tx, refresh_rx) = mpsc::channel();
+        let settings = Settings::load().unwrap_or_default();
         let state = Arc::new(Self {
             snapshots: Mutex::new([
                 ProviderSnapshot::empty(Provider::Claude),
@@ -58,7 +60,8 @@ impl SharedState {
             service_statuses: Mutex::new(std::array::from_fn(|_| {
                 ServiceStatus::new(ServiceStatusLevel::Unavailable)
             })),
-            colors: Mutex::new(Settings::load().unwrap_or_default().colors),
+            colors: Mutex::new(settings.colors),
+            tray_theme: Mutex::new(settings.tray_theme),
             refresh_tx,
             tray_hwnd: AtomicIsize::new(0),
             dashboard_hwnd: AtomicIsize::new(0),
@@ -100,6 +103,20 @@ impl SharedState {
 
     pub fn usage_colors(&self, provider: Provider) -> UsageColors {
         self.colors.lock().unwrap()[provider.index()]
+    }
+
+    pub fn tray_theme(&self) -> TrayTheme {
+        *self.tray_theme.lock().unwrap()
+    }
+
+    pub fn toggle_tray_theme(&self) -> Result<(), String> {
+        let mut theme = self.tray_theme.lock().unwrap();
+        let mut settings = Settings::load()?;
+        settings.tray_theme = theme.toggled();
+        settings.save()?;
+        *theme = settings.tray_theme;
+        self.notify_ui();
+        Ok(())
     }
 
     pub fn request_refresh(&self) {
@@ -271,9 +288,12 @@ pub fn start_refresh_worker(state: Arc<SharedState>, receiver: mpsc::Receiver<Re
                 diagnostics::event("INFO", &format!("{kind} refresh started"));
                 state.refresh_generation.fetch_add(1, Ordering::Relaxed);
                 state.refreshing.store(true, Ordering::Relaxed);
+                let mut theme = state.tray_theme.lock().unwrap();
                 if let Ok(settings) = Settings::load() {
                     *state.colors.lock().unwrap() = settings.colors;
+                    *theme = settings.tray_theme;
                 }
+                drop(theme);
                 state.notify_ui();
                 for provider in Provider::ALL {
                     if refresh_status {
