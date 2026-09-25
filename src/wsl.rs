@@ -13,7 +13,8 @@ use crate::settings::{ProviderSettings, default_directory};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
 const SCRIPT_NAME: &str = "quota-tray";
-const CODEX_SCRIPT: &str = r#"if [ -n "$1" ]; then export CODEX_HOME="$1"; fi; shift; exec codex "$@""#;
+const CODEX_SCRIPT: &str =
+    r#"if [ -n "$1" ]; then export CODEX_HOME="$1"; fi; shift; exec codex "$@""#;
 const CONFIG_PATH_SCRIPT: &str = r#"dir="$1"; if [ -z "$dir" ]; then case "$2" in .codex) dir="${CODEX_HOME:-$HOME/.codex}";; .claude) dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}";; esac; fi; case "$dir" in /*) wslpath -w "$dir";; *) exit 2;; esac"#;
 
 fn base_command(distro: Option<&str>) -> Command {

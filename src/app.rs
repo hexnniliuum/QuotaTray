@@ -1,14 +1,14 @@
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::model::{Provider, ProviderSnapshot, ServiceStatus, ServiceStatusLevel};
 use crate::palette::{TrayTheme, UsageColors};
-use crate::settings::{ProviderSettings, Settings};
+use crate::settings::{Appearance, ProviderSettings, Settings};
 use crate::{diagnostics, providers, service_status, visibility};
 
 pub const WM_USAGE_UPDATED: u32 = 0x8001;
@@ -24,8 +24,7 @@ pub enum RefreshCommand {
 pub struct SharedState {
     snapshots: Mutex<[ProviderSnapshot; Provider::COUNT]>,
     service_statuses: Mutex<[ServiceStatus; Provider::COUNT]>,
-    colors: Mutex<[UsageColors; Provider::COUNT]>,
-    tray_theme: Mutex<TrayTheme>,
+    appearance: Mutex<Appearance>,
     refresh_tx: mpsc::Sender<RefreshCommand>,
     tray_hwnd: AtomicIsize,
     dashboard_hwnd: AtomicIsize,
@@ -33,19 +32,9 @@ pub struct SharedState {
     pub start_with_windows: AtomicBool,
     visible_providers: AtomicU8,
     pub icon_handles: Mutex<[Option<isize>; Provider::COUNT]>,
-    pulse: Mutex<Option<Pulse>>,
     /// Counts refreshes as they start, so the UI can tell a new one from the
     /// one it already animated even when update messages coalesce.
     pub refresh_generation: AtomicU64,
-    /// The refresh generation the dashboard last animated.
-    pub pulsed_generation: AtomicU64,
-}
-
-/// A running refresh trace on the dashboard.
-#[derive(Clone, Copy, Debug)]
-pub struct Pulse {
-    pub started: Instant,
-    pub seed: u64,
 }
 
 impl SharedState {
@@ -60,8 +49,7 @@ impl SharedState {
             service_statuses: Mutex::new(std::array::from_fn(|_| {
                 ServiceStatus::new(ServiceStatusLevel::Unavailable)
             })),
-            colors: Mutex::new(settings.colors),
-            tray_theme: Mutex::new(settings.tray_theme),
+            appearance: Mutex::new(settings.appearance.unwrap_or_default()),
             refresh_tx,
             tray_hwnd: AtomicIsize::new(0),
             dashboard_hwnd: AtomicIsize::new(0),
@@ -69,9 +57,7 @@ impl SharedState {
             start_with_windows: AtomicBool::new(false),
             visible_providers: AtomicU8::new(visibility::load()),
             icon_handles: Mutex::new([None; Provider::COUNT]),
-            pulse: Mutex::new(None),
             refresh_generation: AtomicU64::new(0),
-            pulsed_generation: AtomicU64::new(0),
         });
         (state, refresh_rx)
     }
@@ -102,19 +88,23 @@ impl SharedState {
     }
 
     pub fn usage_colors(&self, provider: Provider) -> UsageColors {
-        self.colors.lock().unwrap()[provider.index()]
+        self.appearance.lock().unwrap().colors[provider.index()]
     }
 
     pub fn tray_theme(&self) -> TrayTheme {
-        *self.tray_theme.lock().unwrap()
+        self.appearance.lock().unwrap().tray_theme
     }
 
     pub fn toggle_tray_theme(&self) -> Result<(), String> {
-        let mut theme = self.tray_theme.lock().unwrap();
+        let mut current = self.appearance.lock().unwrap();
         let mut settings = Settings::load()?;
-        settings.tray_theme = theme.toggled();
+        settings
+            .appearance
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .tray_theme = current.tray_theme.toggled();
         settings.save()?;
-        *theme = settings.tray_theme;
+        *current = settings.appearance?;
         self.notify_ui();
         Ok(())
     }
@@ -129,25 +119,6 @@ impl SharedState {
 
     pub fn request_quit(&self) {
         let _ = self.refresh_tx.send(RefreshCommand::Quit);
-    }
-
-    pub fn start_pulse(&self) {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos() as u64)
-            .unwrap_or(1);
-        *self.pulse.lock().unwrap() = Some(Pulse {
-            started: Instant::now(),
-            seed,
-        });
-    }
-
-    pub fn pulse(&self) -> Option<Pulse> {
-        *self.pulse.lock().unwrap()
-    }
-
-    pub fn clear_pulse(&self) {
-        *self.pulse.lock().unwrap() = None;
     }
 
     pub fn is_provider_visible(&self, provider: Provider) -> bool {
@@ -273,6 +244,7 @@ pub fn start_refresh_worker(state: Arc<SharedState>, receiver: mpsc::Receiver<Re
         .name("usage-refresh".to_string())
         .spawn(move || {
             let mut previous_config: [Option<ProviderSettings>; Provider::COUNT] = [None, None];
+            let mut appearance_error = None;
             let mut command = RefreshCommand::RefreshAll;
             loop {
                 let refresh_status = match command {
@@ -288,12 +260,22 @@ pub fn start_refresh_worker(state: Arc<SharedState>, receiver: mpsc::Receiver<Re
                 diagnostics::event("INFO", &format!("{kind} refresh started"));
                 state.refresh_generation.fetch_add(1, Ordering::Relaxed);
                 state.refreshing.store(true, Ordering::Relaxed);
-                let mut theme = state.tray_theme.lock().unwrap();
+                let mut appearance = state.appearance.lock().unwrap();
                 if let Ok(settings) = Settings::load() {
-                    *state.colors.lock().unwrap() = settings.colors;
-                    *theme = settings.tray_theme;
+                    match settings.appearance {
+                        Ok(loaded) => {
+                            *appearance = loaded;
+                            appearance_error = None;
+                        }
+                        Err(error) => {
+                            if appearance_error.as_ref() != Some(&error) {
+                                diagnostics::event("WARN", &error);
+                            }
+                            appearance_error = Some(error);
+                        }
+                    }
                 }
-                drop(theme);
+                drop(appearance);
                 state.notify_ui();
                 for provider in Provider::ALL {
                     if refresh_status {

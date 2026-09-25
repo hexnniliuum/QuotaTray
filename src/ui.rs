@@ -1,12 +1,14 @@
-use std::ffi::c_void;
+mod animation;
+mod drawing;
+mod layout;
+
+use std::cell::RefCell;
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
-};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DwmSetWindowAttribute,
@@ -31,6 +33,13 @@ use crate::pulse::{self, Frame, Trace};
 use crate::settings::{self, Settings, Source};
 use crate::startup;
 
+use animation::{DashboardAnimation, PULSE_TIMER, PulseClock};
+use drawing::{
+    Font, Layout, bgra, colorref, draw_polyline, draw_text, fill_ellipse, fill_rect,
+    fill_round_rect, measure_text,
+};
+use layout::{CardLayout, CardRow};
+
 const WM_TRAY: u32 = 0x8002;
 const TRAY_CLASS: PCWSTR = w!("QuotaTray.MessageWindow");
 const DASHBOARD_CLASS: PCWSTR = w!("QuotaTray.DashboardWindow");
@@ -52,35 +61,9 @@ const MESSAGE_ROW_HEIGHT: i32 = 54;
 const FOOTER_HEIGHT: i32 = 40;
 /// Right edge of the usage bars; the percentage and reset columns follow.
 const BARS_RIGHT: i32 = 224;
-const PULSE_TIMER: usize = 1;
-const PULSE_FRAME_MS: u32 = 16;
 const MENU_SOURCE_BASE: usize = 1;
 const MENU_ADVANCED_SETTINGS: usize = MENU_SOURCE_BASE + Provider::COUNT * Source::ALL.len();
-
-#[derive(Clone, Copy)]
-struct Layout {
-    scale: f32,
-    theme: TrayTheme,
-}
-
-impl Layout {
-    fn colors(self) -> palette::DashboardColors {
-        self.theme.dashboard()
-    }
-
-    fn px(self, value: i32) -> i32 {
-        (value as f32 * self.scale).round() as i32
-    }
-
-    fn rect(self, left: i32, top: i32, right: i32, bottom: i32) -> RECT {
-        RECT {
-            left: self.px(left),
-            top: self.px(top),
-            right: self.px(right),
-            bottom: self.px(bottom),
-        }
-    }
-}
+const MENU_APPEARANCE_ERROR: usize = MENU_ADVANCED_SETTINGS + 1;
 
 #[derive(Clone, Copy)]
 struct DashboardMetrics {
@@ -98,7 +81,7 @@ impl DashboardMetrics {
                 continue;
             }
             provider_tops[provider.index()] = next_top;
-            next_top += provider_height(&state.snapshot(provider));
+            next_top += CardLayout::new(&state.snapshot(provider)).height;
         }
         let footer_top = next_top + 4;
         Self {
@@ -143,27 +126,6 @@ impl DashboardMetrics {
     }
 }
 
-/// Height of a provider card including the gap below it.
-fn provider_height(snapshot: &ProviderSnapshot) -> i32 {
-    let window_count =
-        usize::from(snapshot.session.is_some()) + usize::from(snapshot.weekly.is_some());
-    let has_usage =
-        window_count > 0 || !snapshot.model_windows.is_empty() || snapshot.extra_usage.is_some();
-    CARD_PAD_TOP
-        + CARD_HEADER_HEIGHT
-        + i32::from(snapshot.from_session_history) * HISTORY_ROW_HEIGHT
-        + window_count as i32 * WINDOW_ROW_HEIGHT
-        + i32::from(!snapshot.model_windows.is_empty()) * MODEL_ROW_HEIGHT
-        + i32::from(snapshot.extra_usage.is_some()) * EXTRA_USAGE_ROW_HEIGHT
-        + if !has_usage || snapshot.error.is_some() {
-            MESSAGE_ROW_HEIGHT
-        } else {
-            0
-        }
-        + CARD_PAD_BOTTOM
-        + CARD_GAP
-}
-
 fn error_summary(error: &str) -> String {
     let prefix: String = error.chars().take(75).collect();
     format!(
@@ -183,7 +145,6 @@ pub fn run(state: Arc<SharedState>) -> windows::core::Result<()> {
         let instance = HINSTANCE(module.0);
         register_classes(instance)?;
 
-        let state_pointer = Arc::into_raw(state.clone()) as *const c_void;
         let tray = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             TRAY_CLASS,
@@ -196,7 +157,7 @@ pub fn run(state: Arc<SharedState>) -> windows::core::Result<()> {
             Some(HWND_MESSAGE),
             None,
             Some(instance),
-            Some(state_pointer),
+            Some((&state as *const Arc<SharedState>).cast()),
         )?;
         state.set_tray_window(tray);
         state
@@ -245,8 +206,7 @@ unsafe extern "system" fn tray_proc(
 ) -> LRESULT {
     match message {
         WM_NCCREATE => {
-            let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
+            attach_window_state(hwnd, lparam);
             LRESULT(1)
         }
         WM_TRAY => {
@@ -269,12 +229,13 @@ unsafe extern "system" fn tray_proc(
             if let Some(state) = state_from_window(hwnd) {
                 unsafe { update_tray_icons(hwnd, state) };
                 let generation = state.refresh_generation.load(Ordering::Relaxed);
-                let refresh_started = state.refreshing.load(Ordering::Relaxed)
-                    && state.pulsed_generation.swap(generation, Ordering::Relaxed) != generation;
                 if let Some(dashboard) = state.dashboard_window() {
                     unsafe {
-                        if refresh_started && IsWindowVisible(dashboard).as_bool() {
-                            begin_pulse(dashboard, state);
+                        if let Some(window) = window_state(dashboard) {
+                            window
+                                .animation
+                                .borrow_mut()
+                                .on_refresh(dashboard, generation);
                         }
                         resize_dashboard_to_content(dashboard, state);
                         let _ = InvalidateRect(Some(dashboard), None, false);
@@ -292,13 +253,7 @@ unsafe extern "system" fn tray_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SharedState;
-            if !pointer.is_null() {
-                unsafe {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    drop(Arc::from_raw(pointer));
-                }
-            }
+            detach_window_state(hwnd);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
@@ -313,8 +268,7 @@ unsafe extern "system" fn dashboard_proc(
 ) -> LRESULT {
     match message {
         WM_NCCREATE => {
-            let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
+            attach_window_state(hwnd, lparam);
             LRESULT(1)
         }
         WM_PAINT => {
@@ -377,7 +331,7 @@ unsafe extern "system" fn dashboard_proc(
                                 CONTENT_LEFT,
                                 top,
                                 CONTENT_RIGHT,
-                                top + provider_height(&snapshot) - CARD_GAP,
+                                top + CardLayout::new(&snapshot).height - CARD_GAP,
                             ),
                         ))
                     .then_some(snapshot.error)
@@ -405,11 +359,15 @@ unsafe extern "system" fn dashboard_proc(
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 };
-                if let Some(state) = state_from_window(hwnd) {
-                    unsafe { end_pulse(hwnd, state) };
+                if let Some(window) = window_state(hwnd) {
+                    window.animation.borrow_mut().stop(hwnd);
                 }
             }
             LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            detach_window_state(hwnd);
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_DPICHANGED => {
@@ -452,6 +410,17 @@ fn show_sources_menu(hwnd: HWND, state: &SharedState) -> Result<(), String> {
             }
             unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, None) }.ok();
         }
+        if settings.appearance.is_err() {
+            unsafe {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    MENU_APPEARANCE_ERROR,
+                    w!("Appearance settings error..."),
+                )
+            }
+            .map_err(|_| "Could not build Sources menu.".to_string())?;
+        }
         unsafe {
             AppendMenuW(
                 menu,
@@ -482,6 +451,12 @@ fn show_sources_menu(hwnd: HWND, state: &SharedState) -> Result<(), String> {
             settings.providers[provider_index].source = Source::ALL[choice % Source::ALL.len()];
             settings.save()?;
             state.request_usage_refresh();
+        } else if selected == MENU_APPEARANCE_ERROR {
+            if let Err(error) = &settings.appearance {
+                return Err(format!(
+                    "{error}\n\nOpen Sources > Edit advanced settings to fix it. Usage sources are unchanged."
+                ));
+            }
         } else if selected == MENU_ADVANCED_SETTINGS {
             let path = settings::settings_path()?;
             if !path.exists() {
@@ -498,9 +473,40 @@ fn show_sources_menu(hwnd: HWND, state: &SharedState) -> Result<(), String> {
     result
 }
 
-fn state_from_window(hwnd: HWND) -> Option<&'static SharedState> {
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SharedState;
+struct WindowState {
+    shared: Arc<SharedState>,
+    animation: RefCell<DashboardAnimation>,
+}
+
+fn attach_window_state(hwnd: HWND, lparam: LPARAM) {
+    let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+    let shared = unsafe { &*(create.lpCreateParams as *const Arc<SharedState>) };
+    let state = Box::new(WindowState {
+        shared: shared.clone(),
+        animation: RefCell::new(DashboardAnimation::new(
+            shared.refresh_generation.load(Ordering::Relaxed),
+        )),
+    });
+    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
+}
+
+fn detach_window_state(hwnd: HWND) {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+    if !pointer.is_null() {
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(pointer));
+        }
+    }
+}
+
+fn window_state(hwnd: HWND) -> Option<&'static WindowState> {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowState;
     unsafe { pointer.as_ref() }
+}
+
+fn state_from_window(hwnd: HWND) -> Option<&'static SharedState> {
+    window_state(hwnd).map(|window| window.shared.as_ref())
 }
 
 unsafe fn update_tray_icons(hwnd: HWND, state: &SharedState) {
@@ -766,9 +772,9 @@ fn status_inner_glow(level: ServiceStatusLevel) -> Option<(Rgb, f64)> {
     Some((palette::service_status_color(level), strength))
 }
 
-unsafe fn create_dashboard(owner: HWND, state: &SharedState) -> Option<HWND> {
+unsafe fn create_dashboard(owner: HWND) -> Option<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.ok()?;
-    let pointer = state as *const SharedState;
+    let shared = &window_state(owner)?.shared;
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -782,7 +788,7 @@ unsafe fn create_dashboard(owner: HWND, state: &SharedState) -> Option<HWND> {
             Some(owner),
             None,
             Some(HINSTANCE(module.0)),
-            Some(pointer.cast()),
+            Some((shared as *const Arc<SharedState>).cast()),
         )
     }
     .ok()?;
@@ -803,7 +809,7 @@ unsafe fn toggle_dashboard(owner: HWND, state: &SharedState) {
     let dashboard = match state.dashboard_window() {
         Some(dashboard) => dashboard,
         None => {
-            let Some(created) = (unsafe { create_dashboard(owner, state) }) else {
+            let Some(created) = (unsafe { create_dashboard(owner) }) else {
                 return;
             };
             state.set_dashboard_window(created);
@@ -813,7 +819,9 @@ unsafe fn toggle_dashboard(owner: HWND, state: &SharedState) {
     if unsafe { IsWindowVisible(dashboard).as_bool() } {
         unsafe {
             let _ = ShowWindow(dashboard, SW_HIDE);
-            end_pulse(dashboard, state);
+            if let Some(window) = window_state(dashboard) {
+                window.animation.borrow_mut().stop(dashboard);
+            }
         };
         return;
     }
@@ -888,28 +896,6 @@ unsafe fn resize_dashboard_to_content(hwnd: HWND, state: &SharedState) {
     }
 }
 
-unsafe fn begin_pulse(hwnd: HWND, state: &SharedState) {
-    state.start_pulse();
-    unsafe {
-        SetTimer(Some(hwnd), PULSE_TIMER, PULSE_FRAME_MS, None);
-        let _ = InvalidateRect(Some(hwnd), None, false);
-    }
-}
-
-unsafe fn end_pulse(hwnd: HWND, state: &SharedState) {
-    state.clear_pulse();
-    unsafe {
-        let _ = KillTimer(Some(hwnd), PULSE_TIMER);
-    }
-}
-
-/// The running refresh trace, as the painter sees it.
-#[derive(Clone, Copy)]
-struct PulseClock {
-    elapsed_ms: f64,
-    seed: u64,
-}
-
 /// Where the next usage bar sits in the pulse sequence and whether any bar is
 /// still drawing.
 struct PulseCursor {
@@ -937,8 +923,8 @@ unsafe fn paint_dashboard(hwnd: HWND, state: &SharedState) {
         let _ = DeleteDC(buffer);
         let _ = EndPaint(hwnd, &paint);
     }
-    if !animating && state.pulse().is_some() {
-        unsafe { end_pulse(hwnd, state) };
+    if let Some(window) = window_state(hwnd) {
+        window.animation.borrow_mut().finish_frame(hwnd, animating);
     }
 }
 
@@ -978,10 +964,7 @@ fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> b
     );
 
     let mut cursor = PulseCursor {
-        clock: state.pulse().map(|pulse| PulseClock {
-            elapsed_ms: pulse.started.elapsed().as_secs_f64() * 1_000.0,
-            seed: pulse.seed,
-        }),
+        clock: window_state(hwnd).and_then(|window| window.animation.borrow().frame()),
         next_bar: 0,
         animating: false,
     };
@@ -1043,7 +1026,8 @@ fn paint_provider(
     cursor: &mut PulseCursor,
 ) {
     let now = now_unix();
-    let card_bottom = top + provider_height(&snapshot) - CARD_GAP;
+    let card = CardLayout::new(&snapshot);
+    let card_bottom = top + card.height - CARD_GAP;
     fill_round_rect(
         dc,
         layout.rect(CONTENT_LEFT, top, CONTENT_RIGHT, card_bottom),
@@ -1099,55 +1083,43 @@ fn paint_provider(
         );
     }
 
-    let mut row_top = header_top + CARD_HEADER_HEIGHT;
-    if snapshot.from_session_history {
-        draw_text(
-            dc,
-            layout,
-            layout.rect(CARD_LEFT, row_top, CARD_RIGHT, row_top + HISTORY_ROW_HEIGHT),
-            &snapshot.freshness_label(now),
-            Font::regular(11),
-            layout.colors().dim_text,
-            DT_LEFT | DT_SINGLELINE,
-        );
-        row_top += HISTORY_ROW_HEIGHT;
-    }
-    let rows_start = row_top;
-    for window in [snapshot.session.as_ref(), snapshot.weekly.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        paint_window_row(dc, colors, window, row_top, layout, cursor);
-        row_top += WINDOW_ROW_HEIGHT;
-    }
-    if !snapshot.model_windows.is_empty() {
-        paint_model_pills(dc, colors, &snapshot.model_windows, row_top, layout);
-        row_top += MODEL_ROW_HEIGHT;
-    }
-    if let Some(budget) = snapshot.extra_usage.as_ref() {
-        paint_extra_usage(dc, budget, row_top, layout);
-        row_top += EXTRA_USAGE_ROW_HEIGHT;
-    }
-    if row_top == rows_start || snapshot.error.is_some() {
-        let message = snapshot
-            .error
-            .as_deref()
-            .map(error_summary)
-            .unwrap_or_else(|| "Waiting for usage...".into());
-        draw_text(
-            dc,
-            layout,
-            layout.rect(
-                CARD_LEFT,
-                row_top + 4,
-                CARD_RIGHT,
-                row_top + MESSAGE_ROW_HEIGHT,
+    for row in card.rows {
+        let row_top = top + row.top;
+        match row.content {
+            CardRow::History => draw_text(
+                dc,
+                layout,
+                layout.rect(CARD_LEFT, row_top, CARD_RIGHT, row_top + HISTORY_ROW_HEIGHT),
+                &snapshot.freshness_label(now),
+                Font::regular(11),
+                layout.colors().dim_text,
+                DT_LEFT | DT_SINGLELINE,
             ),
-            &message,
-            Font::regular(12),
-            layout.colors().muted_text,
-            DT_LEFT | DT_WORDBREAK,
-        );
+            CardRow::Window(window) => {
+                paint_window_row(dc, colors, window, row_top, layout, cursor)
+            }
+            CardRow::Models(windows) => paint_model_pills(dc, colors, windows, row_top, layout),
+            CardRow::ExtraUsage(budget) => paint_extra_usage(dc, budget, row_top, layout),
+            CardRow::Message(error) => {
+                let message = error
+                    .map(error_summary)
+                    .unwrap_or_else(|| "Waiting for usage...".into());
+                draw_text(
+                    dc,
+                    layout,
+                    layout.rect(
+                        CARD_LEFT,
+                        row_top + 4,
+                        CARD_RIGHT,
+                        row_top + MESSAGE_ROW_HEIGHT,
+                    ),
+                    &message,
+                    Font::regular(12),
+                    layout.colors().muted_text,
+                    DT_LEFT | DT_WORDBREAK,
+                );
+            }
+        }
     }
 }
 
@@ -1403,177 +1375,6 @@ fn draw_chip(dc: HDC, layout: Layout, rect: RECT, label: &str, on: bool) {
     );
 }
 
-/// Text size and weight in layout pixels.
-#[derive(Clone, Copy)]
-struct Font {
-    size: i32,
-    weight: FONT_WEIGHT,
-    strikeout: bool,
-}
-
-impl Font {
-    const fn regular(size: i32) -> Self {
-        Self {
-            size,
-            weight: FW_NORMAL,
-            strikeout: false,
-        }
-    }
-
-    const fn semibold(size: i32) -> Self {
-        Self {
-            size,
-            weight: FW_SEMIBOLD,
-            strikeout: false,
-        }
-    }
-
-    const fn bold(size: i32) -> Self {
-        Self {
-            size,
-            weight: FW_BOLD,
-            strikeout: false,
-        }
-    }
-
-    const fn strikeout(self) -> Self {
-        Self {
-            strikeout: true,
-            ..self
-        }
-    }
-}
-
-/// Sizes the font from the window's DPI, not the device context's, so text
-/// matches the layout on every monitor.
-fn create_font(layout: Layout, font: Font) -> HFONT {
-    unsafe {
-        CreateFontW(
-            -layout.px(font.size).max(1),
-            0,
-            0,
-            0,
-            font.weight.0 as i32,
-            0,
-            0,
-            u32::from(font.strikeout),
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH.0 as u32,
-            w!("Segoe UI"),
-        )
-    }
-}
-
-fn draw_text(
-    dc: HDC,
-    layout: Layout,
-    mut rect: RECT,
-    value: &str,
-    font: Font,
-    color: Rgb,
-    alignment: DRAW_TEXT_FORMAT,
-) {
-    unsafe {
-        let font = create_font(layout, font);
-        let old = SelectObject(dc, font.into());
-        SetTextColor(dc, colorref(color));
-        let mut text = value.encode_utf16().collect::<Vec<_>>();
-        DrawTextW(dc, &mut text, &mut rect, alignment | DT_NOPREFIX);
-        SelectObject(dc, old);
-        let _ = DeleteObject(font.into());
-    }
-}
-
-/// Width of `value` in layout pixels.
-fn measure_text(dc: HDC, layout: Layout, value: &str, font: Font) -> i32 {
-    unsafe {
-        let font = create_font(layout, font);
-        let old = SelectObject(dc, font.into());
-        let mut text = value.encode_utf16().collect::<Vec<_>>();
-        let mut rect = RECT::default();
-        DrawTextW(
-            dc,
-            &mut text,
-            &mut rect,
-            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        SelectObject(dc, old);
-        let _ = DeleteObject(font.into());
-        ((rect.right - rect.left) as f32 / layout.scale).ceil() as i32
-    }
-}
-
-fn fill_rect(dc: HDC, rect: RECT, color: Rgb) {
-    unsafe {
-        let brush = CreateSolidBrush(colorref(color));
-        FillRect(dc, &rect, brush);
-        let _ = DeleteObject(brush.into());
-    }
-}
-
-fn fill_round_rect(dc: HDC, rect: RECT, radius: i32, color: Rgb) {
-    unsafe {
-        let brush = CreateSolidBrush(colorref(color));
-        let old_brush = SelectObject(dc, brush.into());
-        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-        // With a null pen GDI leaves out the right and bottom edge; extend by one.
-        let _ = RoundRect(
-            dc,
-            rect.left,
-            rect.top,
-            rect.right + 1,
-            rect.bottom + 1,
-            radius,
-            radius,
-        );
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        let _ = DeleteObject(brush.into());
-    }
-}
-
-fn fill_ellipse(dc: HDC, rect: RECT, color: Rgb) {
-    unsafe {
-        let brush = CreateSolidBrush(colorref(color));
-        let old_brush = SelectObject(dc, brush.into());
-        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-        let _ = Ellipse(dc, rect.left, rect.top, rect.right + 1, rect.bottom + 1);
-        SelectObject(dc, old_pen);
-        SelectObject(dc, old_brush);
-        let _ = DeleteObject(brush.into());
-    }
-}
-
-fn draw_polyline(dc: HDC, points: &[POINT], color: Rgb, width: i32) {
-    if points.len() < 2 {
-        return;
-    }
-    unsafe {
-        let pen = if width <= 1 {
-            CreatePen(PS_SOLID, 1, colorref(color))
-        } else {
-            let brush = LOGBRUSH {
-                lbStyle: BS_SOLID,
-                lbColor: colorref(color),
-                lbHatch: 0,
-            };
-            ExtCreatePen(
-                PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
-                width as u32,
-                &brush,
-                None,
-            )
-        };
-        let old = SelectObject(dc, pen.into());
-        let _ = Polyline(dc, points);
-        SelectObject(dc, old);
-        let _ = DeleteObject(pen.into());
-    }
-}
-
 fn layout_for_window(hwnd: HWND) -> Layout {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     Layout {
@@ -1586,14 +1387,6 @@ fn layout_for_window(hwnd: HWND) -> Layout {
 
 fn point_in_rect(x: i32, y: i32, rect: RECT) -> bool {
     x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
-}
-
-fn colorref(Rgb(red, green, blue): Rgb) -> COLORREF {
-    COLORREF(red as u32 | ((green as u32) << 8) | ((blue as u32) << 16))
-}
-
-fn bgra(Rgb(red, green, blue): Rgb) -> u32 {
-    ((255u32) << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32
 }
 
 fn copy_wide_fixed<const N: usize>(value: &str, target: &mut [u16; N]) {
@@ -1615,13 +1408,16 @@ mod tests {
         let mut snapshot = ProviderSnapshot::empty(Provider::Claude);
         snapshot.error = Some("Missing login. ".repeat(100));
         let card_chrome = CARD_PAD_TOP + CARD_HEADER_HEIGHT + CARD_PAD_BOTTOM + CARD_GAP;
-        assert_eq!(provider_height(&snapshot), card_chrome + MESSAGE_ROW_HEIGHT);
+        assert_eq!(
+            CardLayout::new(&snapshot).height,
+            card_chrome + MESSAGE_ROW_HEIGHT
+        );
         let summary = error_summary(snapshot.error.as_ref().unwrap());
         assert!(summary.len() < 110);
         assert!(summary.ends_with("Click for details."));
         snapshot.session = Some(UsageWindow::new("Session", 10.0, None));
         assert_eq!(
-            provider_height(&snapshot),
+            CardLayout::new(&snapshot).height,
             card_chrome + WINDOW_ROW_HEIGHT + MESSAGE_ROW_HEIGHT
         );
     }
@@ -1631,13 +1427,13 @@ mod tests {
         let mut snapshot = ProviderSnapshot::empty(Provider::Claude);
         snapshot.session = Some(UsageWindow::new("Session", 10.0, None));
         snapshot.weekly = Some(UsageWindow::new("Weekly", 20.0, None));
-        let without_model_window = provider_height(&snapshot);
+        let without_model_window = CardLayout::new(&snapshot).height;
 
         snapshot
             .model_windows
             .push(UsageWindow::new("Fable 5", 30.0, None));
         assert_eq!(
-            provider_height(&snapshot),
+            CardLayout::new(&snapshot).height,
             without_model_window + MODEL_ROW_HEIGHT
         );
 
@@ -1645,7 +1441,7 @@ mod tests {
             .model_windows
             .push(UsageWindow::new("Sonnet", 30.0, None));
         assert_eq!(
-            provider_height(&snapshot),
+            CardLayout::new(&snapshot).height,
             without_model_window + MODEL_ROW_HEIGHT
         );
     }

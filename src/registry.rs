@@ -59,9 +59,8 @@ impl Key {
     pub fn open(subkey: &str, access: u32) -> Option<Self> {
         let subkey = wide(subkey);
         let mut key = null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key)
-        };
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) };
         (status == ERROR_SUCCESS).then_some(Self(key))
     }
 

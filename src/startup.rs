@@ -17,8 +17,8 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
         key.delete(VALUE_NAME);
         return Ok(());
     }
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("Executable path unavailable: {error}"))?;
+    let executable =
+        std::env::current_exe().map_err(|error| format!("Executable path unavailable: {error}"))?;
     let command = wide(format!("\"{}\"", executable.display()))
         .into_iter()
         .flat_map(u16::to_le_bytes)

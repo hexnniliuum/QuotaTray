@@ -81,17 +81,15 @@ pub fn default_directory(provider: Provider) -> &'static str {
 
 #[derive(Clone, Debug)]
 pub struct Settings {
-    pub tray_theme: TrayTheme,
     pub providers: [ProviderSettings; Provider::COUNT],
-    pub colors: [UsageColors; Provider::COUNT],
+    pub appearance: Result<Appearance, String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            tray_theme: TrayTheme::default(),
             providers: std::array::from_fn(|_| ProviderSettings::default()),
-            colors: Provider::ALL.map(UsageColors::for_provider),
+            appearance: Ok(Appearance::default()),
         }
     }
 }
@@ -120,12 +118,6 @@ impl Settings {
             return Err(invalid());
         }
         let mut settings = Self::default();
-        settings.tray_theme = match object.get("tray_theme") {
-            None | Some(Value::Null) => TrayTheme::default(),
-            Some(Value::String(value)) if value == "dark" => TrayTheme::Dark,
-            Some(Value::String(value)) if value == "light" => TrayTheme::Light,
-            _ => return Err("Invalid config.json: tray_theme must be light or dark.".into()),
-        };
         for provider in Provider::ALL {
             let Some(value) = object.get(provider.key()) else {
                 continue;
@@ -180,7 +172,76 @@ impl Settings {
                 return Err(invalid());
             }
             settings.providers[provider.index()] = config;
-            if let Some(value) = fields.get("colors").filter(|value| !value.is_null()) {
+        }
+        settings.appearance = Appearance::parse(&root);
+        Ok(settings)
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let content = serde_json::to_string_pretty(&self.to_json()?).unwrap();
+        let path = settings_path()?;
+        fs::create_dir_all(path.parent().unwrap())
+            .and_then(|_| fs::write(path, content))
+            .map_err(|_| "Could not save config.json.".to_string())
+    }
+
+    fn to_json(&self) -> Result<Value, String> {
+        let appearance = self.appearance.as_ref().map_err(Clone::clone)?;
+        let mut root = json!({"tray_theme": match appearance.tray_theme {
+            TrayTheme::Dark => "dark",
+            TrayTheme::Light => "light",
+        }});
+        for provider in Provider::ALL {
+            let config = &self.providers[provider.index()];
+            let colors = appearance.colors[provider.index()];
+            root[provider.key()] = json!({
+                "source": config.source.key(),
+                "distro": config.distro,
+                "windows_config_dir": config.windows_config_dir,
+                "wsl_config_dir": config.wsl_config_dir,
+                "colors": {
+                    "normal": format_color(colors.normal),
+                    "warning": format_color(colors.warning),
+                },
+            });
+        }
+        Ok(root)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Appearance {
+    pub tray_theme: TrayTheme,
+    pub colors: [UsageColors; Provider::COUNT],
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            tray_theme: TrayTheme::default(),
+            colors: Provider::ALL.map(UsageColors::for_provider),
+        }
+    }
+}
+
+impl Appearance {
+    fn parse(root: &Value) -> Result<Self, String> {
+        let tray_theme = match root.get("tray_theme") {
+            None | Some(Value::Null) => TrayTheme::default(),
+            Some(Value::String(value)) if value == "dark" => TrayTheme::Dark,
+            Some(Value::String(value)) if value == "light" => TrayTheme::Light,
+            _ => return Err("Invalid config.json: tray_theme must be light or dark.".into()),
+        };
+        let mut appearance = Self {
+            tray_theme,
+            ..Self::default()
+        };
+        for provider in Provider::ALL {
+            if let Some(value) = root
+                .get(provider.key())
+                .and_then(|fields| fields.get("colors"))
+                .filter(|value| !value.is_null())
+            {
                 let invalid_color = || {
                     format!(
                         "Invalid config.json: {}.colors must contain normal or warning colors in #RRGGBB format.",
@@ -194,7 +255,7 @@ impl Settings {
                 {
                     return Err(invalid_color());
                 }
-                let target = &mut settings.colors[provider.index()];
+                let target = &mut appearance.colors[provider.index()];
                 for (key, color) in [
                     ("normal", &mut target.normal),
                     ("warning", &mut target.warning),
@@ -208,36 +269,7 @@ impl Settings {
                 }
             }
         }
-        Ok(settings)
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        let path = settings_path()?;
-        fs::create_dir_all(path.parent().unwrap())
-            .and_then(|_| fs::write(path, serde_json::to_string_pretty(&self.to_json()).unwrap()))
-            .map_err(|_| "Could not save config.json.".to_string())
-    }
-
-    fn to_json(&self) -> Value {
-        let mut root = json!({"tray_theme": match self.tray_theme {
-            TrayTheme::Dark => "dark",
-            TrayTheme::Light => "light",
-        }});
-        for provider in Provider::ALL {
-            let config = &self.providers[provider.index()];
-            let colors = self.colors[provider.index()];
-            root[provider.key()] = json!({
-                "source": config.source.key(),
-                "distro": config.distro,
-                "windows_config_dir": config.windows_config_dir,
-                "wsl_config_dir": config.wsl_config_dir,
-                "colors": {
-                    "normal": format_color(colors.normal),
-                    "warning": format_color(colors.warning),
-                },
-            });
-        }
-        root
+        Ok(appearance)
     }
 }
 
@@ -296,15 +328,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn appearance_errors_preserve_sources_and_cannot_overwrite_the_config() {
+        for content in [
+            r#"{"tray_theme":"lgiht","claude":{"source":"wsl","distro":"Ubuntu"},"codex":{"source":"windows"}}"#,
+            r#"{"claude":{"source":"wsl","distro":"Ubuntu","colors":{"normal":"red"}},"codex":{"source":"windows"}}"#,
+        ] {
+            let mut settings = Settings::parse(content).unwrap();
+            assert_eq!(settings.providers[0].source, Source::Wsl);
+            assert_eq!(settings.providers[0].distro.as_deref(), Some("Ubuntu"));
+            assert_eq!(settings.providers[1].source, Source::Windows);
+            assert!(settings.appearance.is_err());
+            settings.providers[0].source = Source::Windows;
+            assert!(settings.to_json().is_err());
+        }
+    }
+
+    #[test]
+    fn appearance_errors_do_not_hide_invalid_sources() {
+        assert!(
+            Settings::parse(r#"{"tray_theme":"lgiht","claude":{"source":"windwos"}}"#).is_err()
+        );
+    }
+
+    #[test]
     fn tray_theme_defaults_and_survives_saving_source_settings() {
-        assert_eq!(Settings::parse("{}").unwrap().tray_theme, TrayTheme::Dark);
+        assert_eq!(
+            Settings::parse("{}")
+                .unwrap()
+                .appearance
+                .unwrap()
+                .tray_theme,
+            TrayTheme::Dark
+        );
         let mut settings = Settings::parse(r#"{"tray_theme":"light"}"#).unwrap();
         settings.providers[0].source = Source::Wsl;
-        let loaded = Settings::parse(&settings.to_json().to_string()).unwrap();
-        assert_eq!(loaded.tray_theme, TrayTheme::Light);
+        let loaded = Settings::parse(&settings.to_json().unwrap().to_string()).unwrap();
+        assert_eq!(loaded.appearance.unwrap().tray_theme, TrayTheme::Light);
         assert_eq!(loaded.providers[0].source, Source::Wsl);
-        assert!(Settings::parse(r#"{"tray_theme":"lgiht"}"#).is_err());
-        assert!(Settings::parse(r#"{"tray_theme":true}"#).is_err());
+        assert!(
+            Settings::parse(r#"{"tray_theme":"lgiht"}"#)
+                .unwrap()
+                .appearance
+                .is_err()
+        );
+        assert!(
+            Settings::parse(r#"{"tray_theme":true}"#)
+                .unwrap()
+                .appearance
+                .is_err()
+        );
     }
 
     #[test]
@@ -329,7 +401,10 @@ mod tests {
         assert!(!legacy.exists());
         let settings = Settings::parse(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(settings.providers[0].source, Source::Wsl);
-        assert_eq!(settings.colors[0].normal, Rgb(18, 52, 86));
+        assert_eq!(
+            settings.appearance.as_ref().unwrap().colors[0].normal,
+            Rgb(18, 52, 86)
+        );
         fs::write(&legacy, "legacy file must not replace config").unwrap();
         assert_eq!(config_path(&directory).unwrap(), path);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -389,20 +464,35 @@ mod tests {
 
     #[test]
     fn missing_colors_use_defaults_and_partial_overrides_keep_other_defaults() {
-        let defaults = Settings::default();
-        assert_eq!(Settings::parse("{}").unwrap().colors, defaults.colors);
+        let defaults = Appearance::default();
+        assert_eq!(
+            Settings::parse("{}").unwrap().appearance.unwrap().colors,
+            defaults.colors
+        );
         let settings = Settings::parse(
             r##"{"claude":{"colors":{"normal":"#12aB34"}},"codex":{"colors":{"warning":"#56789a"}}}"##,
         ).unwrap();
-        assert_eq!(settings.colors[0].at(75.0), Rgb(18, 171, 52));
-        assert_eq!(settings.colors[0].at(80.0), defaults.colors[0].warning);
-        assert_eq!(settings.colors[1].at(79.9), defaults.colors[1].normal);
-        assert_eq!(settings.colors[1].at(80.0), Rgb(86, 120, 154));
+        assert_eq!(
+            settings.appearance.as_ref().unwrap().colors[0].at(75.0),
+            Rgb(18, 171, 52)
+        );
+        assert_eq!(
+            settings.appearance.as_ref().unwrap().colors[0].at(80.0),
+            defaults.colors[0].warning
+        );
+        assert_eq!(
+            settings.appearance.as_ref().unwrap().colors[1].at(79.9),
+            defaults.colors[1].normal
+        );
+        assert_eq!(
+            settings.appearance.as_ref().unwrap().colors[1].at(80.0),
+            Rgb(86, 120, 154)
+        );
         let cleared = Settings::parse(
             r#"{"claude":{"colors":null},"codex":{"colors":{"normal":null,"warning":null}}}"#,
         )
         .unwrap();
-        assert_eq!(cleared.colors, defaults.colors);
+        assert_eq!(cleared.appearance.as_ref().unwrap().colors, defaults.colors);
     }
 
     #[test]
@@ -411,10 +501,16 @@ mod tests {
             Settings::parse(r##"{"claude":{"colors":{"normal":"#123456","warning":"#ABCDEF"}}}"##)
                 .unwrap();
         settings.providers[0].source = Source::Windows;
-        let reloaded = Settings::parse(&settings.to_json().to_string()).unwrap();
+        let reloaded = Settings::parse(&settings.to_json().unwrap().to_string()).unwrap();
         assert_eq!(reloaded.providers, settings.providers);
-        assert_eq!(reloaded.colors, settings.colors);
-        assert_eq!(reloaded.colors[0].at(80.0), Rgb(171, 205, 239));
+        assert_eq!(
+            reloaded.appearance.as_ref().unwrap().colors,
+            settings.appearance.as_ref().unwrap().colors
+        );
+        assert_eq!(
+            reloaded.appearance.as_ref().unwrap().colors[0].at(80.0),
+            Rgb(171, 205, 239)
+        );
     }
 
     #[test]
@@ -430,7 +526,7 @@ mod tests {
             json!([]),
         ] {
             let content = json!({"claude": {"colors": colors}}).to_string();
-            let error = Settings::parse(&content).unwrap_err();
+            let error = Settings::parse(&content).unwrap().appearance.unwrap_err();
             assert!(error.contains("claude.colors"));
             assert!(error.contains("#RRGGBB"));
         }

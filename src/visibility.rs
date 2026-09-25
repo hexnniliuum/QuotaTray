@@ -6,8 +6,8 @@ const ALL_PROVIDERS: u8 = 0b11;
 
 pub fn load() -> u8 {
     let mut data = [0u8; 4];
-    let stored = Key::open(SETTINGS_KEY, KEY_QUERY_VALUE)
-        .and_then(|key| key.query(VALUE_NAME, &mut data));
+    let stored =
+        Key::open(SETTINGS_KEY, KEY_QUERY_VALUE).and_then(|key| key.query(VALUE_NAME, &mut data));
     let mask = data[0] & ALL_PROVIDERS;
     match stored {
         Some((REG_DWORD, 4)) if mask != 0 => mask,
