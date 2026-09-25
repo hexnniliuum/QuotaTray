@@ -108,10 +108,11 @@ fn parse_windows_path(output: &[u8]) -> Result<PathBuf, String> {
 }
 
 fn decode_console(output: &[u8]) -> String {
-    if output.len() >= 2 && output.chunks_exact(2).any(|pair| pair[1] == 0) {
-        let words = output
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    let (pairs, _) = output.as_chunks::<2>();
+    if pairs.iter().any(|pair| pair[1] == 0) {
+        let words = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         String::from_utf16_lossy(&words)
             .trim_matches('\0')
