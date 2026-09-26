@@ -476,6 +476,11 @@ fn show_sources_menu(hwnd: HWND, state: &SharedState) -> Result<(), String> {
             if !path.exists() {
                 settings.save()?;
             }
+            // A packaged launcher can redirect AppData. Notepad needs the
+            // physical file path because it runs outside that package context.
+            let path = path
+                .canonicalize()
+                .map_err(|_| "Could not resolve config.json for editing.".to_string())?;
             std::process::Command::new("notepad.exe")
                 .arg(path)
                 .spawn()
