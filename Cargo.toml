@@ -1,6 +1,6 @@
 [package]
 name = "quota-tray"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Minimal Windows tray indicators for Claude and Codex subscription usage"
 license = "MIT"
