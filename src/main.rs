@@ -21,10 +21,15 @@ use std::os::windows::ffi::OsStrExt;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::w;
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--preview-resets") {
+        if let Err(error) = ui::preview_resets() {
+            report_startup_error(&error);
+        }
+        return;
+    }
     let mutex = unsafe { CreateMutexW(None, false, w!("Local\\QuotaTray.SingleInstance")) };
     let Ok(mutex) = mutex else {
         return;
@@ -35,7 +40,7 @@ fn main() {
     }
 
     if let Err(error) = diagnostics::init() {
-        show_error(&format!(
+        report_startup_error(&format!(
             "Quota Tray could not initialize its diagnostic log.\n\n{error}"
         ));
     }
@@ -44,22 +49,15 @@ fn main() {
     app::start_refresh_worker(state.clone(), receiver);
     if let Err(error) = ui::run(state) {
         diagnostics::event("ERROR", &format!("UI loop stopped with an error: {error}"));
-        show_error(&format!("Quota Tray could not start.\n\n{error}"));
+        report_startup_error(&format!("Quota Tray could not start.\n\n{error}"));
     }
     diagnostics::shutdown();
     unsafe { CloseHandle(mutex).ok() };
 }
 
-fn show_error(message: &str) {
-    let wide = wide(message);
-    unsafe {
-        MessageBoxW(
-            None,
-            windows::core::PCWSTR(wide.as_ptr()),
-            w!("Quota Tray"),
-            MB_OK | MB_ICONERROR,
-        );
-    }
+fn report_startup_error(message: &str) {
+    diagnostics::event("ERROR", message);
+    eprintln!("{message}");
 }
 
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {

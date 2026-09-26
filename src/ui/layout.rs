@@ -1,4 +1,4 @@
-use crate::model::{ExtraUsageBudget, ProviderSnapshot, UsageWindow};
+use crate::model::{ExtraUsageBudget, Provider, ProviderSnapshot, UsageWindow};
 
 use super::{
     CARD_GAP, CARD_HEADER_HEIGHT, CARD_PAD_BOTTOM, CARD_PAD_TOP, EXTRA_USAGE_ROW_HEIGHT,
@@ -10,6 +10,7 @@ pub(super) enum CardRow<'a> {
     Window(&'a UsageWindow),
     Models(&'a [UsageWindow]),
     ExtraUsage(&'a ExtraUsageBudget),
+    Resets,
     Message(Option<&'a str>),
 }
 
@@ -20,6 +21,7 @@ impl CardRow<'_> {
             Self::Window(_) => WINDOW_ROW_HEIGHT,
             Self::Models(_) => MODEL_ROW_HEIGHT,
             Self::ExtraUsage(_) => EXTRA_USAGE_ROW_HEIGHT,
+            Self::Resets => EXTRA_USAGE_ROW_HEIGHT,
             Self::Message(_) => MESSAGE_ROW_HEIGHT,
         }
     }
@@ -56,6 +58,14 @@ impl<'a> CardLayout<'a> {
         }
         if rows.len() == usage_start || snapshot.error.is_some() {
             rows.push(CardRow::Message(snapshot.error.as_deref()));
+        }
+        if snapshot.provider == Provider::Codex
+            && snapshot
+                .reset_credits
+                .as_ref()
+                .is_none_or(|credits| credits.available_count != 0)
+        {
+            rows.push(CardRow::Resets);
         }
         let mut top = CARD_PAD_TOP + CARD_HEADER_HEIGHT;
         let rows = rows
@@ -100,12 +110,28 @@ mod tests {
             PositionedRow { content: CardRow::Models(_), .. },
             PositionedRow { content: CardRow::ExtraUsage(_), .. },
             PositionedRow { content: CardRow::Message(Some("Refresh failed")), .. },
+            PositionedRow { content: CardRow::Resets, .. },
         ] if session.label == "Session" && weekly.label == "Weekly"));
         assert_eq!(
             layout.rows.iter().map(|row| row.top).collect::<Vec<_>>(),
-            [42, 62, 108, 154, 184, 214]
+            [42, 62, 108, 154, 184, 214, 268]
         );
-        assert_eq!(layout.height, 286);
+        assert_eq!(layout.height, 316);
+    }
+
+    #[test]
+    fn zero_resets_do_not_add_a_dashboard_action() {
+        let mut snapshot = ProviderSnapshot::empty(Provider::Codex);
+        snapshot.reset_credits = Some(crate::model::ResetCredits {
+            available_count: 0,
+            credits: Some(vec![]),
+        });
+        assert!(
+            !CardLayout::new(&snapshot)
+                .rows
+                .iter()
+                .any(|row| matches!(row.content, CardRow::Resets))
+        );
     }
 
     #[test]
@@ -114,10 +140,12 @@ mod tests {
         for history in [false, true] {
             snapshot.from_session_history = history;
             let layout = CardLayout::new(&snapshot);
-            assert!(matches!(
-                layout.rows.last().unwrap().content,
-                CardRow::Message(None)
-            ));
+            assert!(
+                layout
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row.content, CardRow::Message(None)))
+            );
         }
     }
 }

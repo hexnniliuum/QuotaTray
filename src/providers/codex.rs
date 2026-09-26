@@ -2,14 +2,17 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::model::{Provider, ProviderSnapshot, UsageWindow, now_unix, parse_rfc3339_unix};
+use crate::model::{
+    Provider, ProviderSnapshot, ResetCredit, ResetCredits, UsageWindow, now_unix,
+    parse_rfc3339_unix,
+};
 use crate::process::ManagedChild;
 use crate::settings::{ProviderSettings, Source, try_sources};
 use crate::wsl;
@@ -25,14 +28,7 @@ struct RawWindow {
 
 pub fn refresh(config: &ProviderSettings) -> Result<ProviderSnapshot, String> {
     try_sources(config.source, |source| {
-        let command = match source {
-            Source::Wsl => wsl::codex_command(config),
-            _ => {
-                let mut command = windows_command();
-                command.env("CODEX_HOME", config.windows_dir(Provider::Codex)?);
-                command
-            }
-        };
+        let command = source_command(config, source)?;
         live_or_sessions(
             || read_from_app_server(command),
             || {
@@ -74,53 +70,202 @@ fn live_or_sessions(
     })
 }
 
-fn read_from_app_server(mut command: Command) -> Result<ProviderSnapshot, String> {
-    command
-        .args(["app-server", "--listen", "stdio://"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW);
-    let mut child = ManagedChild::spawn(&mut command)?;
+fn source_command(config: &ProviderSettings, source: Source) -> Result<Command, String> {
+    if source == Source::Wsl {
+        Ok(wsl::codex_command(config))
+    } else {
+        let mut command = windows_command();
+        command.env("CODEX_HOME", config.windows_dir(Provider::Codex)?);
+        Ok(command)
+    }
+}
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Codex input pipe failed.".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Codex output pipe failed.".to_string())?;
-    let (result_tx, result_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let result = (|| {
-            write_json_line(
-                &mut stdin,
-                &json!({
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "clientInfo": {"name": "quota-tray", "version": env!("CARGO_PKG_VERSION")},
-                        "capabilities": {"experimentalApi": true}
-                    }
-                }),
-            )?;
-            read_response(&mut reader, 1)?;
-            write_json_line(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
-            write_json_line(
-                &mut stdin,
-                &json!({"id": 2, "method": "account/rateLimits/read", "params": {}}),
-            )?;
-            let response = read_response(&mut reader, 2)?;
-            parse_app_server_response(&response)
-        })();
-        let _ = result_tx.send(result);
-    });
+#[derive(Debug, PartialEq)]
+pub enum ResetOutcome {
+    Applied,
+    AlreadyApplied,
+    NothingToReset,
+    NoCredit,
+}
 
-    let result = result_rx.recv_timeout(Duration::from_secs(12));
-    drop(child);
-    result.map_err(|_| "Codex usage query timed out.".to_string())?
+/// One connection is retained throughout selection and redemption. Never fall
+/// back to another source after the user has selected a credit.
+pub struct ResetSession {
+    server: AppServer,
+    pub snapshot: ProviderSnapshot,
+    pub source: Source,
+    account: Value,
+    workspace: Value,
+}
+
+impl ResetSession {
+    pub fn open(config: &ProviderSettings) -> Result<Self, String> {
+        try_sources(config.source, |source| {
+            let mut server = AppServer::connect(source_command(config, source)?)?;
+            let account = server.request("account/read", json!({"refreshToken": false}))?;
+            let workspace = account["result"]["workspaceRouting"].clone();
+            let account = account
+                .get("result")
+                .and_then(|r| r.get("account"))
+                .filter(|a| !a.is_null())
+                .cloned()
+                .ok_or("Sign in to Codex in the selected environment.")?;
+            let snapshot =
+                parse_app_server_response(&server.request("account/rateLimits/read", json!({}))?)?;
+            Ok(Self {
+                server,
+                snapshot,
+                source,
+                account,
+                workspace,
+            })
+        })
+    }
+
+    pub fn account_label(&self) -> &str {
+        self.account
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("Signed-in Codex account")
+    }
+
+    pub fn consume(&mut self, credit_id: Option<&str>, key: &str) -> Result<ResetOutcome, String> {
+        let account = self
+            .server
+            .request("account/read", json!({"refreshToken": false}))?;
+        if account.get("result").and_then(|r| r.get("account")) != Some(&self.account)
+            || account["result"]["workspaceRouting"] != self.workspace
+        {
+            return Err(
+                "The Codex account changed or its workspace changed. Reopen Available resets."
+                    .into(),
+            );
+        }
+        let latest = self.server.request("account/rateLimits/read", json!({}))?;
+        let credits = parse_reset_credits(&latest["result"])
+            .ok_or("Reset availability is unknown. Update Codex and try again.")?;
+        if credits.available_count == 0 {
+            return Ok(ResetOutcome::NoCredit);
+        }
+        if let Some(id) = credit_id
+            && !credits
+                .choices(now_unix())
+                .iter()
+                .any(|credit| credit.id == id)
+        {
+            return Err("That reset is no longer available. Reopen Available resets.".into());
+        }
+        let mut params = json!({"idempotencyKey": key});
+        if let Some(id) = credit_id {
+            params["creditId"] = json!(id);
+        }
+        let response = self.server.request("account/rateLimitResetCredit/consume", params)
+            .map_err(|_| "The reset result could not be confirmed. Check Codex usage before trying another reset.".to_string())?;
+        let outcome = reset_outcome(&response)?;
+        // The consume response does not contain the resulting usage windows.
+        let refreshed = self.server.request("account/rateLimits/read", json!({}));
+        if let Ok(snapshot) = refreshed.and_then(|value| parse_app_server_response(&value)) {
+            self.snapshot = snapshot;
+        }
+        Ok(outcome)
+    }
+}
+
+fn reset_outcome(response: &Value) -> Result<ResetOutcome, String> {
+    match response["result"]["outcome"].as_str() {
+        Some("reset") => Ok(ResetOutcome::Applied),
+        Some("alreadyRedeemed") => Ok(ResetOutcome::AlreadyApplied),
+        Some("nothingToReset") => Ok(ResetOutcome::NothingToReset),
+        Some("noCredit") => Ok(ResetOutcome::NoCredit),
+        _ => Err(
+            "The reset result was not recognized. Check Codex usage before trying another reset."
+                .into(),
+        ),
+    }
+}
+
+struct AppServer {
+    _child: ManagedChild,
+    stdin: ChildStdin,
+    responses: mpsc::Receiver<Value>,
+    next_id: i64,
+}
+
+impl AppServer {
+    fn connect(mut command: Command) -> Result<Self, String> {
+        command
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        let mut child = ManagedChild::spawn(&mut command)?;
+        let stdin = child.stdin.take().ok_or("Codex input pipe failed.")?;
+        let stdout = child.stdout.take().ok_or("Codex output pipe failed.")?;
+        let (tx, responses) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && value.get("id").is_some()
+                    && tx.send(value).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut server = Self {
+            _child: child,
+            stdin,
+            responses,
+            next_id: 1,
+        };
+        server.request(
+            "initialize",
+            json!({
+                "clientInfo": {"name": "quota-tray", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"experimentalApi": true}
+            }),
+        )?;
+        write_json_line(
+            &mut server.stdin,
+            &json!({"method": "initialized", "params": {}}),
+        )?;
+        Ok(server)
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_json_line(
+            &mut self.stdin,
+            &json!({"id": id, "method": method, "params": params}),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let response = self
+                .responses
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| "Codex request timed out or the connection closed.".to_string())?;
+            if response.get("id").and_then(Value::as_i64) != Some(id) {
+                continue;
+            }
+            return checked_response(response);
+        }
+    }
+}
+
+fn checked_response(response: Value) -> Result<Value, String> {
+    if response.get("error").is_some_and(|error| !error.is_null()) {
+        return Err("Codex rejected the request. Check your sign-in and update Codex if this feature is unavailable.".into());
+    }
+    Ok(response)
+}
+
+fn read_from_app_server(command: Command) -> Result<ProviderSnapshot, String> {
+    parse_app_server_response(
+        &AppServer::connect(command)?.request("account/rateLimits/read", json!({}))?,
+    )
 }
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<(), String> {
@@ -130,32 +275,6 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<(), String>
         .write_all(b"\n")
         .and_then(|_| writer.flush())
         .map_err(|error| format!("Could not send Codex request: {error}"))
-}
-
-fn read_response(reader: &mut impl BufRead, expected_id: i64) -> Result<Value, String> {
-    for _ in 0..30 {
-        let mut line = String::new();
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            return Err("Codex app server closed unexpectedly.".to_string());
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if value.get("id").and_then(Value::as_i64) == Some(expected_id) {
-            if value.get("error").is_some_and(|error| !error.is_null()) {
-                return Err(
-                    "Codex rejected the usage request. Sign in again in the selected environment."
-                        .into(),
-                );
-            }
-            return Ok(value);
-        }
-    }
-    Err("Codex app server did not return usage data.".to_string())
 }
 
 fn parse_app_server_response(response: &Value) -> Result<ProviderSnapshot, String> {
@@ -178,10 +297,56 @@ fn parse_app_server_response(response: &Value) -> Result<ProviderSnapshot, Strin
         if !windows.is_empty() {
             let mut snapshot = snapshot_from_windows(windows);
             snapshot.last_updated_unix = Some(now_unix());
+            snapshot.reset_credits = parse_reset_credits(result);
             return Ok(snapshot);
         }
     }
+    if let Some(credits) = parse_reset_credits(result) {
+        let mut snapshot = ProviderSnapshot::empty(Provider::Codex);
+        snapshot.reset_credits = Some(credits);
+        snapshot.last_updated_unix = Some(now_unix());
+        return Ok(snapshot);
+    }
     Err("Codex returned no subscription usage windows.".to_string())
+}
+
+fn parse_reset_credits(result: &Value) -> Option<ResetCredits> {
+    let value = result.get("rateLimitResetCredits")?;
+    Some(ResetCredits {
+        available_count: value.get("availableCount")?.as_u64()?,
+        credits: value.get("credits").and_then(Value::as_array).map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    if row.get("status")?.as_str()? != "available"
+                        || row.get("resetType")?.as_str()? != "codexRateLimits"
+                    {
+                        return None;
+                    }
+                    let id = row.get("id")?.as_str()?.to_string();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    Some(ResetCredit {
+                        id,
+                        title: row
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Rate-limit reset")
+                            .to_string(),
+                        description: row
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Reset an eligible Codex usage window.")
+                            .to_string(),
+                        expires_at: row.get("expiresAt").and_then(Value::as_i64),
+                        expiry_known: row
+                            .get("expiresAt")
+                            .is_some_and(|v| v.is_null() || v.as_i64().is_some()),
+                    })
+                })
+                .collect()
+        }),
+    })
 }
 
 fn parse_camel_window(value: &Value) -> Option<RawWindow> {
@@ -331,6 +496,128 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_details_keep_count_filter_unavailable_and_sort_expiry() {
+        let credits = parse_reset_credits(&json!({"rateLimitResetCredits": {
+            "availableCount": 9,
+            "credits": [
+                {"id":"unknown", "resetType":"codexRateLimits", "status":"available", "expiresAt":null},
+                {"id":"later", "resetType":"codexRateLimits", "status":"available", "expiresAt":300},
+                {"id":"first", "resetType":"codexRateLimits", "status":"available", "expiresAt":200},
+                {"id":"expired", "resetType":"codexRateLimits", "status":"available", "expiresAt":100},
+                {"id":"used", "resetType":"codexRateLimits", "status":"redeemed", "expiresAt":400},
+                {"id":"other", "resetType":"other", "status":"available", "expiresAt":400}
+            ]
+        }})).unwrap();
+        assert_eq!(credits.available_count, 9);
+        assert_eq!(
+            credits
+                .choices(100)
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "later", "unknown"]
+        );
+    }
+
+    #[test]
+    fn reset_availability_distinguishes_missing_count_only_and_empty_details() {
+        assert!(parse_reset_credits(&json!({})).is_none());
+        assert!(parse_reset_credits(&json!({"rateLimitResetCredits":null})).is_none());
+        let count_only = parse_reset_credits(
+            &json!({"rateLimitResetCredits": {"availableCount":2,"credits":null}}),
+        )
+        .unwrap();
+        assert!(count_only.credits.is_none());
+        let empty = parse_reset_credits(
+            &json!({"rateLimitResetCredits": {"availableCount":0,"credits":[]}}),
+        )
+        .unwrap();
+        assert!(empty.credits.unwrap().is_empty());
+        let snapshot = parse_app_server_response(
+            &json!({"result":{"rateLimitResetCredits":{"availableCount":2}}}),
+        )
+        .unwrap();
+        assert_eq!(snapshot.reset_credits.unwrap().available_count, 2);
+    }
+
+    #[test]
+    fn redemption_outcomes_are_explicit_and_unknown_is_not_success() {
+        for outcome in ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"] {
+            assert!(reset_outcome(&json!({"result":{"outcome":outcome}})).is_ok());
+        }
+        assert!(reset_outcome(&json!({"result":{"outcome":"futureOutcome"}})).is_err());
+    }
+
+    #[test]
+    fn reset_session_checks_account_sends_selected_credit_and_refreshes() {
+        let root =
+            std::env::temp_dir().join(format!("quota-tray-reset-mock-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("server.ps1");
+        fs::write(&script, r#"
+while ($line = [Console]::ReadLine()) {
+    $request = $line | ConvertFrom-Json
+    if ($request.method -eq 'initialized') { continue }
+    $result = @{}
+    switch ($request.method) {
+        'account/read' { $result = @{ account = @{ type = 'chatgpt'; email = 'test@example.invalid' } } }
+        'account/rateLimits/read' {
+            $result = @{ rateLimits = @{ primary = @{ usedPercent = 12; windowDurationMins = 300 } };
+                rateLimitResetCredits = @{ availableCount = 1; credits = @(@{ id = 'selected'; resetType = 'codexRateLimits'; status = 'available' }) } }
+        }
+        'account/rateLimitResetCredit/consume' {
+            if ($request.params.creditId -ne 'selected' -or $request.params.idempotencyKey -ne 'stable-test-key') { exit 1 }
+            $result = @{ outcome = 'reset' }
+        }
+    }
+    [Console]::WriteLine((@{ id = $request.id; result = $result } | ConvertTo-Json -Depth 10 -Compress))
+}
+"#).unwrap();
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script);
+        let mut session = ResetSession {
+            server: AppServer::connect(command).unwrap(),
+            snapshot: ProviderSnapshot::empty(Provider::Codex),
+            source: Source::Windows,
+            account: json!({"type":"chatgpt", "email":"test@example.invalid"}),
+            workspace: Value::Null,
+        };
+        assert!(
+            session
+                .consume(Some("missing"), "stable-test-key")
+                .unwrap_err()
+                .contains("no longer available")
+        );
+        assert_eq!(
+            session
+                .consume(Some("selected"), "stable-test-key")
+                .unwrap(),
+            ResetOutcome::Applied
+        );
+        assert_eq!(
+            session.snapshot.session.as_ref().unwrap().used_percent,
+            12.0
+        );
+        session.account = json!({"type":"chatgpt", "email":"changed@example.invalid"});
+        assert!(
+            session
+                .consume(Some("selected"), "stable-test-key")
+                .unwrap_err()
+                .contains("account changed")
+        );
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reads_live_usage_through_a_windows_cmd_launcher() {
         let root =
             std::env::temp_dir().join(format!("quota-tray-cli with spaces-{}", std::process::id()));
@@ -432,10 +719,10 @@ Start-Sleep -Seconds 30
 
     #[test]
     fn app_server_error_details_are_not_exposed() {
-        let response = b"{\"id\":2,\"error\":{\"message\":\"private account detail\"}}\n";
-        let error = read_response(&mut &response[..], 2).unwrap_err();
+        let response = json!({"id": 2, "error": {"message": "private account detail"}});
+        let error = checked_response(response).unwrap_err();
         assert!(!error.contains("private account detail"));
-        assert!(error.contains("Sign in"));
+        assert!(error.contains("sign-in"));
     }
 
     #[test]
