@@ -13,22 +13,19 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::CoCreateGuid;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx};
-use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED,
-};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::app::{SharedState, WM_USAGE_UPDATED};
-use crate::model::{Provider, ResetCredit, format_countdown, now_unix};
+use crate::model::{Provider, ResetCredit, now_unix};
 use crate::providers::codex::{ResetOutcome, ResetSession};
 use crate::settings::Settings;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
-const LIST: usize = 100;
 const DETAILS: usize = 101;
-const CLASS: PCWSTR = w!("QuotaTray.ResetChooser");
+const CLASS: PCWSTR = w!("QuotaTray.ResetConfirmation");
 
 pub(super) fn is_open() -> bool {
     OPEN.load(Ordering::Relaxed)
@@ -42,7 +39,7 @@ pub(super) fn open(state: Arc<SharedState>) {
     notify(&state);
     let worker_state = state.clone();
     if std::thread::Builder::new()
-        .name("codex-reset-chooser".into())
+        .name("codex-reset-confirmation".into())
         .spawn(move || {
             let result = run(&worker_state);
             if let Err(error) = result {
@@ -54,7 +51,7 @@ pub(super) fn open(state: Arc<SharedState>) {
         .is_err()
     {
         OPEN.store(false, Ordering::Relaxed);
-        state.report_error("Could not open the reset chooser.");
+        state.report_error("Could not open the reset confirmation.");
         notify(&state);
     }
 }
@@ -71,48 +68,41 @@ fn run(state: &SharedState) -> Result<(), String> {
     let credits = session.snapshot.reset_credits.as_ref()
         .ok_or("This Codex version or account did not provide reset availability. Update Codex and try again.")?;
     if credits.available_count == 0 {
-        choose(
+        confirm(
             "No resets are available for this Codex account.",
-            Vec::new(),
+            None,
             false,
             state.tray_theme(),
             false,
         )?;
+        state.request_usage_refresh();
         return Ok(());
     }
     let choices = credits.choices(now_unix());
+    let first = choices.first().cloned();
+    let auto = credits.credits.is_none() || choices.len() < credits.available_count as usize;
+    let selection = first.as_ref().map(|credit| credit.id.clone());
     let mut content = format!(
-        "{} · {}\r\n{} resets available. Applying consumes one reset.\r\n",
+        "{} · {}\r\n",
         session.account_label(),
-        session.source.label(),
-        credits.available_count
+        session.source.label()
     );
-    for window in [
-        session.snapshot.session.as_ref(),
-        session.snapshot.weekly.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    if let Some(credit) = &first {
         content.push_str(&format!(
-            "{}: {:.0}% used · {}\r\n",
-            window.label,
-            window.used_percent,
-            format_countdown(window.resets_at_unix, now_unix())
+            "{} · {}\r\n",
+            credit.title,
+            expiry_label(credit.expires_at, credit.expiry_known, now_unix())
         ));
+    } else if auto {
+        content.push_str("Codex will use the next available reset.\r\n");
+    } else {
+        content.push_str("No unexpired resets are available.\r\n");
     }
-    if choices.len() < credits.available_count as usize {
-        content.push_str(
-            "Some reset details are unavailable. Codex can choose the next available reset.\r\n",
-        );
-    }
-    let offer_auto = credits.credits.is_none() || choices.len() < credits.available_count as usize;
-    let selection = choose(&content, choices, offer_auto, state.tray_theme(), false)?;
-    let Some(selection) = selection else {
+    if !confirm(&content, first, auto, state.tray_theme(), false)? {
         return Ok(());
-    };
+    }
     if Settings::load()?.providers[Provider::Codex.index()] != config {
-        return Err("Source settings changed. Reopen Available resets.".into());
+        return Err("Source settings changed. Reopen Reset.".into());
     }
     let key = unsafe { CoCreateGuid() }.map_err(|_| "Could not prepare a reset request.")?;
     let result = session.consume(selection.as_deref(), &format!("{key:?}"));
@@ -131,24 +121,18 @@ fn run(state: &SharedState) -> Result<(), String> {
 
 pub(super) fn preview() -> Result<(), String> {
     let theme = Settings::load()?.appearance?.tray_theme;
-    let choices = [("Sample reset", 2 * 86400), ("Sample reset", 7 * 86400)]
-        .map(|(title, remaining)| ResetCredit {
-            id: "preview-only".into(),
-            title: title.into(),
-            description:
-                "Example reset for previewing the chooser. No account changes can be made here."
-                    .into(),
-            expires_at: Some(now_unix() + remaining),
-            expiry_known: true,
-        })
-        .to_vec();
-    choose(
-        "Preview · sample resets\r\nThese are examples, not resets on your account.\r\nApplying is disabled in this preview.",
-        choices,
-        false,
-        theme,
-        true,
-    )?;
+    let credit = ResetCredit {
+        id: "preview-only".into(),
+        title: "Sample reset".into(),
+        description: "Preview only".into(),
+        expires_at: Some(now_unix() + 2 * 86400),
+        expiry_known: true,
+    };
+    let content = format!(
+        "Preview · sample reset\r\n{} · Applying disabled.",
+        credit.description
+    );
+    confirm(&content, Some(credit), false, theme, true)?;
     Ok(())
 }
 
@@ -168,7 +152,7 @@ impl DialogStyle {
         Self {
             layout,
             background: unsafe { CreateSolidBrush(colorref(layout.colors().background)) },
-            font: create_font(layout, Font::regular(14)),
+            font: create_font(layout, Font::regular(11)),
             icon: super::create_circle_icon(
                 "Q",
                 100.0,
@@ -190,30 +174,36 @@ impl Drop for DialogStyle {
     }
 }
 
-struct Chooser {
-    choices: Vec<ResetCredit>,
+struct Confirmation {
+    credit: Option<ResetCredit>,
     auto: bool,
-    selected: Option<Option<String>>,
+    confirmed: bool,
     style: DialogStyle,
     preview: bool,
 }
 
-fn choose(
+impl Confirmation {
+    fn can_apply(&self) -> bool {
+        !self.preview && (self.credit.is_some() || self.auto)
+    }
+}
+
+fn confirm(
     content: &str,
-    choices: Vec<ResetCredit>,
+    credit: Option<ResetCredit>,
     auto: bool,
     theme: TrayTheme,
     preview: bool,
-) -> Result<Option<Option<String>>, String> {
-    let mut data = Chooser {
-        choices,
+) -> Result<bool, String> {
+    let mut data = Confirmation {
+        credit,
         auto,
-        selected: None,
+        confirmed: false,
         style: DialogStyle::new(theme),
         preview,
     };
     unsafe {
-        let hwnd = create_chooser(content, &mut data)?;
+        let hwnd = create_confirmation(content, &mut data)?;
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let mut msg = MSG::default();
@@ -235,11 +225,11 @@ fn choose(
             DestroyWindow(hwnd).ok();
         }
     }
-    Ok(data.selected)
+    Ok(data.confirmed)
 }
 
 // The caller keeps data at a stable address until the returned window is destroyed.
-unsafe fn create_chooser(content: &str, data: &mut Chooser) -> Result<HWND, String> {
+unsafe fn create_confirmation(content: &str, data: &mut Confirmation) -> Result<HWND, String> {
     unsafe {
         let instance = GetModuleHandleW(None).map_err(|_| "Could not load the dialog.")?;
         let class = WNDCLASSW {
@@ -250,31 +240,27 @@ unsafe fn create_chooser(content: &str, data: &mut Chooser) -> Result<HWND, Stri
 
             ..Default::default()
         };
-        // The class remains registered for subsequent chooser threads.
+        // The class remains registered for subsequent confirmation threads.
         RegisterClassW(&class);
         let layout = data.style.layout;
         let px = |v| layout.px(v);
-        let rows = (data.choices.len() + usize::from(data.auto)).clamp(1, 4) as i32;
-        let list_height = rows * 60;
-        let details_top = 158 + list_height;
-        let buttons_top = details_top + 72;
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             CLASS,
             if data.preview {
-                w!("QuotaTray — Codex resets (preview)")
+                w!("QuotaTray (preview)")
             } else {
-                w!("QuotaTray — Codex resets")
+                w!("QuotaTray")
             },
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            px(600),
-            px(buttons_top + 90),
+            px(360),
+            px(170),
             None,
             None,
             Some(instance.into()),
-            Some((data as *mut Chooser).cast()),
+            Some((data as *mut Confirmation).cast()),
         )
         .map_err(|_| "Could not create the reset dialog.")?;
         for kind in [ICON_SMALL, ICON_BIG] {
@@ -334,92 +320,38 @@ unsafe fn create_chooser(content: &str, data: &mut Chooser) -> Result<HWND, Stri
             };
             control(
                 w!("STATIC"),
+                "Apply reset?",
+                WINDOW_STYLE::default(),
+                0,
+                [14, 12, 316, 18],
+            )?;
+            control(
+                w!("STATIC"),
                 content,
                 WINDOW_STYLE::default(),
-                0,
-                [20, 16, 544, 106],
-            )?;
-            control(
-                w!("STATIC"),
-                "Choose a reset (soonest expiry first):",
-                WINDOW_STYLE::default(),
-                0,
-                [20, 126, 544, 22],
-            )?;
-            let list = control(
-                w!("LISTBOX"),
-                "",
-                WS_TABSTOP
-                    | WS_VSCROLL
-                    | WINDOW_STYLE((LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32),
-                LIST,
-                [20, 152, 544, list_height],
-            )?;
-            for credit in &data.choices {
-                let text = crate::wide(format!(
-                    "{} — {}",
-                    credit.title,
-                    expiry_label(credit.expires_at, credit.expiry_known, now_unix())
-                ));
-                SendMessageW(
-                    list,
-                    LB_ADDSTRING,
-                    None,
-                    Some(LPARAM(text.as_ptr() as isize)),
-                );
-            }
-            if data.choices.is_empty() && !data.auto {
-                let text = crate::wide("No resets available");
-                SendMessageW(
-                    list,
-                    LB_ADDSTRING,
-                    None,
-                    Some(LPARAM(text.as_ptr() as isize)),
-                );
-            }
-            if data.auto {
-                let text =
-                    crate::wide("Let Codex choose the next available reset (expiry unavailable)");
-                SendMessageW(
-                    list,
-                    LB_ADDSTRING,
-                    None,
-                    Some(LPARAM(text.as_ptr() as isize)),
-                );
-            }
-            control(
-                w!("STATIC"),
-                "",
-                WINDOW_STYLE::default(),
                 DETAILS,
-                [20, details_top, 544, 60],
+                [14, 36, 316, 48],
             )?;
             control(
                 w!("BUTTON"),
-                "Apply selected reset",
+                "Yes",
                 WS_TABSTOP
                     | WINDOW_STYLE(BS_OWNERDRAW as u32)
-                    | if data.preview || (data.choices.is_empty() && !data.auto) {
-                        WS_DISABLED
-                    } else {
+                    | if data.can_apply() {
                         WINDOW_STYLE::default()
+                    } else {
+                        WS_DISABLED
                     },
-                IDOK.0 as usize,
-                [274, buttons_top, 180, 34],
+                IDYES.0 as usize,
+                [196, 96, 62, 26],
             )?;
             control(
                 w!("BUTTON"),
-                if data.preview || (data.choices.is_empty() && !data.auto) {
-                    "Close"
-                } else {
-                    "Cancel"
-                },
+                "No",
                 WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
-                IDCANCEL.0 as usize,
-                [466, buttons_top, 98, 34],
+                IDNO.0 as usize,
+                [268, 96, 62, 26],
             )?;
-            SendMessageW(list, LB_SETCURSEL, Some(WPARAM(0)), None);
-            update_details(hwnd, data);
             Ok(())
         })();
         if result.is_err() {
@@ -437,10 +369,10 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Chooser;
+        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Confirmation;
         let data = pointer.as_ref();
         match msg {
-            DM_GETDEFID => LRESULT(IDOK.0 as isize | ((DC_HASDEFID as isize) << 16)),
+            DM_GETDEFID => LRESULT(IDNO.0 as isize | ((DC_HASDEFID as isize) << 16)),
             WM_ERASEBKGND => {
                 if let Some(data) = data {
                     let mut rect = Default::default();
@@ -454,7 +386,7 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
-            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            WM_CTLCOLORSTATIC => {
                 if let Some(data) = data {
                     let dc = HDC(wp.0 as *mut _);
                     let colors = data.style.layout.colors();
@@ -463,14 +395,6 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     return LRESULT(data.style.background.0 as isize);
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
-            }
-            WM_MEASUREITEM => {
-                if let Some(data) = data {
-                    let item = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
-                    item.itemHeight = data.style.layout.px(60) as u32;
-                    return LRESULT(1);
-                }
-                LRESULT(0)
             }
             WM_DRAWITEM => {
                 if let Some(data) = data {
@@ -481,34 +405,27 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_COMMAND => {
                 let id = wp.0 & 0xffff;
-                if id == IDCANCEL.0 as usize {
+                if id == IDNO.0 as usize || id == IDCANCEL.0 as usize {
                     DestroyWindow(hwnd).ok();
-                } else if let Some(data) = data {
-                    if id == LIST {
-                        update_details(hwnd, data);
-                    } else if id == IDOK.0 as usize {
-                        if data.preview || (data.choices.is_empty() && !data.auto) {
-                            return LRESULT(0);
-                        }
-                        let index = selected_index(hwnd);
-                        if let Some(credit) = data.choices.get(index) {
-                            if credit.expires_at.is_some_and(|expiry| expiry <= now_unix()) {
-                                if let Ok(details) = GetDlgItem(Some(hwnd), DETAILS as i32) {
-                                    let _ = SetWindowTextW(
-                                        details,
-                                        w!("This reset has expired. Choose another reset."),
-                                    );
-                                }
-                                return LRESULT(0);
-                            }
-                            (*pointer).selected = Some(Some(credit.id.clone()));
-                        } else if data.auto && index == data.choices.len() {
-                            (*pointer).selected = Some(None);
-                        } else {
-                            return LRESULT(0);
-                        }
-                        DestroyWindow(hwnd).ok();
+                } else if id == IDYES.0 as usize
+                    && let Some(data) = data
+                {
+                    if !data.can_apply() {
+                        return LRESULT(0);
                     }
+                    if data.credit.as_ref().is_some_and(|credit| {
+                        credit.expires_at.is_some_and(|expiry| expiry <= now_unix())
+                    }) {
+                        if let Ok(details) = GetDlgItem(Some(hwnd), DETAILS as i32) {
+                            let _ = SetWindowTextW(
+                                details,
+                                w!("This reset has expired. Reopen Reset to try again."),
+                            );
+                        }
+                        return LRESULT(0);
+                    }
+                    (*pointer).confirmed = true;
+                    DestroyWindow(hwnd).ok();
                 }
                 LRESULT(0)
             }
@@ -525,7 +442,7 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
-fn paint_item(item: &DRAWITEMSTRUCT, data: &Chooser) {
+fn paint_item(item: &DRAWITEMSTRUCT, data: &Confirmation) {
     let layout = data.style.layout;
     let colors = layout.colors();
     let dc = item.hDC;
@@ -537,97 +454,29 @@ fn paint_item(item: &DRAWITEMSTRUCT, data: &Chooser) {
     fill_rect(dc, item.rcItem, colors.background);
     let mut rect = item.rcItem;
     rect.bottom -= layout.px(4);
-    if item.CtlID as usize == LIST {
-        if item.itemID == u32::MAX {
-            return;
-        }
-        fill_round_rect(
-            dc,
-            rect,
-            layout.px(8),
-            if selected {
-                colors.muted_text
-            } else {
-                colors.card
-            },
-        );
-        rect.left += layout.px(1);
-        rect.top += layout.px(1);
-        rect.right -= layout.px(1);
-        rect.bottom -= layout.px(1);
-        fill_round_rect(
-            dc,
-            rect,
-            layout.px(7),
-            if selected { colors.button } else { colors.card },
-        );
-        let (title, expiry) = match data.choices.get(item.itemID as usize) {
-            Some(credit) => (
-                credit.title.as_str(),
-                expiry_label(credit.expires_at, credit.expiry_known, now_unix()),
-            ),
-            None if !data.auto => (
-                "No resets available",
-                "New resets will appear here when available.".into(),
-            ),
-            None => (
-                "Let Codex choose",
-                "Next available reset · expiry unavailable".into(),
-            ),
-        };
-        rect.left += layout.px(14);
-        rect.right -= layout.px(10);
-        let mut title_rect = rect;
-        title_rect.top += layout.px(7);
-        title_rect.bottom = title_rect.top + layout.px(20);
-        draw_text(
-            dc,
-            layout,
-            title_rect,
-            title,
-            Font::semibold(14),
-            colors.text,
-            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-        let mut expiry_rect = rect;
-        expiry_rect.top += layout.px(29);
-        draw_text(
-            dc,
-            layout,
-            expiry_rect,
-            &expiry,
-            Font::regular(12),
-            colors.muted_text,
-            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-    } else {
-        fill_round_rect(
-            dc,
-            rect,
-            layout.px(7),
-            if selected { colors.pill } else { colors.button },
-        );
-        let label = if item.CtlID == IDOK.0 as u32 {
-            "Apply selected reset"
-        } else if data.preview || (data.choices.is_empty() && !data.auto) {
-            "Close"
+    fill_round_rect(
+        dc,
+        rect,
+        layout.px(7),
+        if selected { colors.pill } else { colors.button },
+    );
+    draw_text(
+        dc,
+        layout,
+        rect,
+        if item.CtlID == IDYES.0 as u32 {
+            "Yes"
         } else {
-            "Cancel"
-        };
-        draw_text(
-            dc,
-            layout,
-            rect,
-            label,
-            Font::semibold(13),
-            if item.itemState.0 & ODS_DISABLED.0 != 0 {
-                colors.off_text
-            } else {
-                colors.text
-            },
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-    }
+            "No"
+        },
+        Font::semibold(11),
+        if item.itemState.0 & ODS_DISABLED.0 != 0 {
+            colors.off_text
+        } else {
+            colors.text
+        },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
     if focused {
         rect.left += layout.px(3);
         rect.right -= layout.px(3);
@@ -635,28 +484,6 @@ fn paint_item(item: &DRAWITEMSTRUCT, data: &Chooser) {
         rect.bottom -= layout.px(3);
         unsafe {
             let _ = DrawFocusRect(dc, &rect);
-        }
-    }
-}
-
-unsafe fn selected_index(hwnd: HWND) -> usize {
-    unsafe {
-        GetDlgItem(Some(hwnd), LIST as i32)
-            .map(|list| SendMessageW(list, LB_GETCURSEL, None, None).0 as usize)
-            .unwrap_or(usize::MAX)
-    }
-}
-
-unsafe fn update_details(hwnd: HWND, data: &Chooser) {
-    unsafe {
-        let text = match data.choices.get(selected_index(hwnd)) {
-            Some(credit) => credit.description.clone(),
-            None if !data.auto => "Nothing to apply. You can close this window.".into(),
-            None => "Codex chooses which reset to consume. Individual details and expiry are unavailable.".into(),
-        };
-        if let Ok(details) = GetDlgItem(Some(hwnd), DETAILS as i32) {
-            let text = crate::wide(text);
-            SetWindowTextW(details, PCWSTR(text.as_ptr())).ok();
         }
     }
 }
@@ -719,42 +546,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_chooser_selects_exact_credit_auto_or_cancel() {
+    fn native_confirmation_requires_yes_and_blocks_unavailable_resets() {
         std::thread::spawn(|| unsafe {
-            for (index, command, expected) in [
-                (0, IDOK, Some(Some("first".to_string()))),
-                (1, IDOK, Some(Some("second".to_string()))),
-                (2, IDOK, Some(None)),
-                (0, IDCANCEL, None),
+            for (credit, auto, preview, command, expected) in [
+                (true, false, false, IDYES, true),
+                (true, false, false, IDNO, false),
+                (true, false, false, IDCANCEL, false),
+                (false, true, false, IDYES, true),
+                (false, false, false, IDYES, false),
+                (true, false, true, IDYES, false),
             ] {
-                let mut data = Chooser {
-                    choices: ["first", "second"]
-                        .map(|id| ResetCredit {
-                            id: id.into(),
-                            title: id.into(),
-                            description: "Test reset".into(),
-                            expires_at: Some(now_unix() + 3600),
-                            expiry_known: true,
-                        })
-                        .to_vec(),
-                    auto: true,
-                    preview: command == IDCANCEL,
-                    selected: None,
-                    style: DialogStyle::new(if index % 2 == 0 {
-                        TrayTheme::Dark
-                    } else {
+                let mut data = Confirmation {
+                    credit: credit.then(|| ResetCredit {
+                        id: "first".into(),
+                        title: "First reset".into(),
+                        description: "Test reset".into(),
+                        expires_at: Some(now_unix() + 3600),
+                        expiry_known: true,
+                    }),
+                    auto,
+                    preview,
+                    confirmed: false,
+                    style: DialogStyle::new(if preview {
                         TrayTheme::Light
+                    } else {
+                        TrayTheme::Dark
                     }),
                 };
-                let hwnd = create_chooser("Test account · Windows", &mut data).unwrap();
+                let hwnd = create_confirmation("Test account · Windows", &mut data).unwrap();
                 let mut title = [0u16; 128];
                 let length = GetWindowTextW(hwnd, &mut title) as usize;
                 assert_eq!(
                     String::from_utf16_lossy(&title[..length]),
-                    if data.preview {
-                        "QuotaTray — Codex resets (preview)"
+                    if preview {
+                        "QuotaTray (preview)"
                     } else {
-                        "QuotaTray — Codex resets"
+                        "QuotaTray"
                     }
                 );
                 for kind in [ICON_SMALL, ICON_BIG] {
@@ -764,21 +591,42 @@ mod tests {
                     );
                     assert!(!data.style.icon.0.is_null());
                 }
-                let list = GetDlgItem(Some(hwnd), LIST as i32).unwrap();
-                assert_eq!(SendMessageW(list, LB_GETCOUNT, None, None).0, 3);
-                assert_eq!(selected_index(hwnd), 0);
-                SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None);
-                if data.preview {
-                    let apply = GetDlgItem(Some(hwnd), IDOK.0).unwrap();
-                    assert_ne!(GetWindowLongW(apply, GWL_STYLE) as u32 & WS_DISABLED.0, 0);
-                    SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(IDOK.0 as usize)), None);
-                    assert!(IsWindow(Some(hwnd)).as_bool());
-                    assert_eq!(data.selected, None);
-                }
+                let yes = GetDlgItem(Some(hwnd), IDYES.0).unwrap();
+                assert_eq!(
+                    GetWindowLongW(yes, GWL_STYLE) as u32 & WS_DISABLED.0 != 0,
+                    !data.can_apply()
+                );
+                assert_eq!(
+                    SendMessageW(hwnd, DM_GETDEFID, None, None).0 & 0xffff,
+                    IDNO.0 as isize
+                );
                 SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(command.0 as usize)), None);
+                assert_eq!(data.confirmed, expected);
+                if command == IDYES && !data.can_apply() {
+                    assert!(IsWindow(Some(hwnd)).as_bool());
+                    SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(IDNO.0 as usize)), None);
+                }
                 assert!(!IsWindow(Some(hwnd)).as_bool());
-                assert_eq!(data.selected, expected);
             }
+
+            let mut data = Confirmation {
+                credit: Some(ResetCredit {
+                    id: "expired".into(),
+                    title: "Expired reset".into(),
+                    description: "Test reset".into(),
+                    expires_at: Some(now_unix() - 1),
+                    expiry_known: true,
+                }),
+                auto: false,
+                preview: false,
+                confirmed: false,
+                style: DialogStyle::new(TrayTheme::Dark),
+            };
+            let hwnd = create_confirmation("Test account · Windows", &mut data).unwrap();
+            SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(IDYES.0 as usize)), None);
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            assert!(!data.confirmed);
+            SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(IDNO.0 as usize)), None);
         })
         .join()
         .unwrap();

@@ -60,6 +60,7 @@ const HISTORY_ROW_HEIGHT: i32 = 20;
 const WINDOW_ROW_HEIGHT: i32 = 46;
 const MODEL_ROW_HEIGHT: i32 = 30;
 const EXTRA_USAGE_ROW_HEIGHT: i32 = 30;
+const RESET_ROW_HEIGHT: i32 = 20;
 const MESSAGE_ROW_HEIGHT: i32 = 54;
 const FOOTER_HEIGHT: i32 = 40;
 /// Right edge of the usage bars; the percentage and reset columns follow.
@@ -305,10 +306,10 @@ unsafe extern "system" fn dashboard_proc(
                                 layout.rect(
                                     CARD_LEFT,
                                     metrics.provider_top(Provider::Codex) + row.top,
-                                    CARD_RIGHT,
+                                    CARD_LEFT + 100,
                                     metrics.provider_top(Provider::Codex)
                                         + row.top
-                                        + EXTRA_USAGE_ROW_HEIGHT,
+                                        + RESET_ROW_HEIGHT,
                                 ),
                             )
                     });
@@ -1162,21 +1163,29 @@ fn paint_provider(
             CardRow::Models(windows) => paint_model_pills(dc, colors, windows, row_top, layout),
             CardRow::ExtraUsage(budget) => paint_extra_usage(dc, budget, row_top, layout),
             CardRow::Resets => {
-                let label = if resets::is_open() {
-                    "Managing resets...".into()
-                } else {
-                    match snapshot.reset_credits.as_ref() {
-                        Some(credits) if snapshot.error.is_none() => {
-                            format!("Available resets ({})...", credits.available_count)
-                        }
-                        _ => "Available resets...".into(),
+                let label = match snapshot.reset_credits.as_ref() {
+                    Some(credits) if snapshot.error.is_none() => {
+                        format!("Reset ×{}", credits.available_count)
                     }
+                    _ => "Reset".into(),
                 };
-                draw_button(
+                draw_text(
                     dc,
-                    layout.rect(CARD_LEFT, row_top, CARD_RIGHT, row_top + 26),
-                    &label,
                     layout,
+                    layout.rect(
+                        CARD_LEFT,
+                        row_top,
+                        CARD_LEFT + 100,
+                        row_top + RESET_ROW_HEIGHT,
+                    ),
+                    &label,
+                    Font::regular(11),
+                    if resets::is_open() {
+                        layout.colors().off_text
+                    } else {
+                        layout.colors().dim_text
+                    },
+                    DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
             }
             CardRow::Message(error) => {

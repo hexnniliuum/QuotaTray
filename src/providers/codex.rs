@@ -136,10 +136,7 @@ impl ResetSession {
         if account.get("result").and_then(|r| r.get("account")) != Some(&self.account)
             || account["result"]["workspaceRouting"] != self.workspace
         {
-            return Err(
-                "The Codex account changed or its workspace changed. Reopen Available resets."
-                    .into(),
-            );
+            return Err("The Codex account changed or its workspace changed. Reopen Reset.".into());
         }
         let latest = self.server.request("account/rateLimits/read", json!({}))?;
         let credits = parse_reset_credits(&latest["result"])
@@ -153,7 +150,7 @@ impl ResetSession {
                 .iter()
                 .any(|credit| credit.id == id)
         {
-            return Err("That reset is no longer available. Reopen Available resets.".into());
+            return Err("That reset is no longer available. Reopen Reset.".into());
         }
         let mut params = json!({"idempotencyKey": key});
         if let Some(id) = credit_id {

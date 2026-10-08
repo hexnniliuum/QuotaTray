@@ -2,7 +2,7 @@ use crate::model::{ExtraUsageBudget, Provider, ProviderSnapshot, UsageWindow};
 
 use super::{
     CARD_GAP, CARD_HEADER_HEIGHT, CARD_PAD_BOTTOM, CARD_PAD_TOP, EXTRA_USAGE_ROW_HEIGHT,
-    HISTORY_ROW_HEIGHT, MESSAGE_ROW_HEIGHT, MODEL_ROW_HEIGHT, WINDOW_ROW_HEIGHT,
+    HISTORY_ROW_HEIGHT, MESSAGE_ROW_HEIGHT, MODEL_ROW_HEIGHT, RESET_ROW_HEIGHT, WINDOW_ROW_HEIGHT,
 };
 
 pub(super) enum CardRow<'a> {
@@ -21,7 +21,7 @@ impl CardRow<'_> {
             Self::Window(_) => WINDOW_ROW_HEIGHT,
             Self::Models(_) => MODEL_ROW_HEIGHT,
             Self::ExtraUsage(_) => EXTRA_USAGE_ROW_HEIGHT,
-            Self::Resets => EXTRA_USAGE_ROW_HEIGHT,
+            Self::Resets => RESET_ROW_HEIGHT,
             Self::Message(_) => MESSAGE_ROW_HEIGHT,
         }
     }
@@ -40,6 +40,14 @@ pub(super) struct CardLayout<'a> {
 impl<'a> CardLayout<'a> {
     pub fn new(snapshot: &'a ProviderSnapshot) -> Self {
         let mut rows = Vec::new();
+        if snapshot.provider == Provider::Codex
+            && snapshot
+                .reset_credits
+                .as_ref()
+                .is_none_or(|credits| credits.available_count != 0)
+        {
+            rows.push(CardRow::Resets);
+        }
         if snapshot.from_session_history {
             rows.push(CardRow::History);
         }
@@ -58,14 +66,6 @@ impl<'a> CardLayout<'a> {
         }
         if rows.len() == usage_start || snapshot.error.is_some() {
             rows.push(CardRow::Message(snapshot.error.as_deref()));
-        }
-        if snapshot.provider == Provider::Codex
-            && snapshot
-                .reset_credits
-                .as_ref()
-                .is_none_or(|credits| credits.available_count != 0)
-        {
-            rows.push(CardRow::Resets);
         }
         let mut top = CARD_PAD_TOP + CARD_HEADER_HEIGHT;
         let rows = rows
@@ -104,19 +104,19 @@ mod tests {
         snapshot.error = Some("Refresh failed".into());
         let layout = CardLayout::new(&snapshot);
         assert!(matches!(layout.rows.as_slice(), [
+            PositionedRow { content: CardRow::Resets, .. },
             PositionedRow { content: CardRow::History, .. },
             PositionedRow { content: CardRow::Window(session), .. },
             PositionedRow { content: CardRow::Window(weekly), .. },
             PositionedRow { content: CardRow::Models(_), .. },
             PositionedRow { content: CardRow::ExtraUsage(_), .. },
             PositionedRow { content: CardRow::Message(Some("Refresh failed")), .. },
-            PositionedRow { content: CardRow::Resets, .. },
         ] if session.label == "Session" && weekly.label == "Weekly"));
         assert_eq!(
             layout.rows.iter().map(|row| row.top).collect::<Vec<_>>(),
-            [42, 62, 108, 154, 184, 214, 268]
+            [42, 62, 82, 128, 174, 204, 234]
         );
-        assert_eq!(layout.height, 316);
+        assert_eq!(layout.height, 306);
     }
 
     #[test]
