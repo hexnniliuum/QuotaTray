@@ -25,6 +25,7 @@ pub struct SharedState {
     snapshots: Mutex<[ProviderSnapshot; Provider::COUNT]>,
     service_statuses: Mutex<[ServiceStatus; Provider::COUNT]>,
     appearance: Mutex<Appearance>,
+    notice: Mutex<Option<String>>,
     refresh_tx: mpsc::Sender<RefreshCommand>,
     tray_hwnd: AtomicIsize,
     dashboard_hwnd: AtomicIsize,
@@ -50,6 +51,7 @@ impl SharedState {
                 ServiceStatus::new(ServiceStatusLevel::Unavailable)
             })),
             appearance: Mutex::new(settings.appearance.unwrap_or_default()),
+            notice: Mutex::new(None),
             refresh_tx,
             tray_hwnd: AtomicIsize::new(0),
             dashboard_hwnd: AtomicIsize::new(0),
@@ -109,7 +111,23 @@ impl SharedState {
         Ok(())
     }
 
+    pub fn notice(&self) -> Option<String> {
+        self.notice.lock().unwrap().clone()
+    }
+
+    pub fn report_error(&self, message: &str) {
+        diagnostics::event("ERROR", message);
+        *self.notice.lock().unwrap() = Some(message.to_string());
+        self.notify_ui();
+    }
+
+    pub fn clear_notice(&self) {
+        *self.notice.lock().unwrap() = None;
+        self.notify_ui();
+    }
+
     pub fn request_refresh(&self) {
+        self.clear_notice();
         let _ = self.refresh_tx.send(RefreshCommand::RefreshAll);
     }
 
@@ -225,7 +243,7 @@ impl SharedState {
         self.notify_ui();
     }
 
-    fn notify_ui(&self) {
+    pub fn notify_ui(&self) {
         if let Some(hwnd) = self.tray_window() {
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_USAGE_UPDATED, WPARAM(0), LPARAM(0));

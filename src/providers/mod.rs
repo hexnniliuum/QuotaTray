@@ -1,5 +1,5 @@
 mod claude;
-mod codex;
+pub mod codex;
 
 use crate::model::{Provider, ProviderSnapshot};
 use crate::settings::ProviderSettings;

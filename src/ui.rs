@@ -1,6 +1,7 @@
 mod animation;
 mod drawing;
 mod layout;
+mod resets;
 
 use std::cell::RefCell;
 use std::mem::size_of;
@@ -59,6 +60,7 @@ const HISTORY_ROW_HEIGHT: i32 = 20;
 const WINDOW_ROW_HEIGHT: i32 = 46;
 const MODEL_ROW_HEIGHT: i32 = 30;
 const EXTRA_USAGE_ROW_HEIGHT: i32 = 30;
+const RESET_ROW_HEIGHT: i32 = 20;
 const MESSAGE_ROW_HEIGHT: i32 = 54;
 const FOOTER_HEIGHT: i32 = 40;
 /// Right edge of the usage bars; the percentage and reset columns follow.
@@ -77,7 +79,7 @@ struct DashboardMetrics {
 impl DashboardMetrics {
     fn from_state(state: &SharedState) -> Self {
         let mut provider_tops = [0; Provider::COUNT];
-        let mut next_top = 58;
+        let mut next_top = 58 + if state.notice().is_some() { 68 } else { 0 };
         for provider in Provider::ALL {
             if !state.is_provider_visible(provider) {
                 continue;
@@ -294,7 +296,21 @@ unsafe extern "system" fn dashboard_proc(
                 let metrics = DashboardMetrics::from_state(state);
                 let x = (lparam.0 as i16) as i32;
                 let y = ((lparam.0 >> 16) as i16) as i32;
-                if point_in_rect(x, y, metrics.refresh_rect(layout)) {
+                let codex = state.snapshot(Provider::Codex);
+                let reset_hit = state.is_provider_visible(Provider::Codex)
+                    && CardLayout::new(&codex).rows.iter().any(|row| {
+                        matches!(row.content, CardRow::Resets)
+                            && point_in_rect(
+                                x,
+                                y,
+                                reset_rect(layout, metrics.provider_top(Provider::Codex) + row.top),
+                            )
+                    });
+                if reset_hit {
+                    if let Some(window) = window_state(hwnd) {
+                        resets::open(window.shared.clone());
+                    }
+                } else if point_in_rect(x, y, metrics.refresh_rect(layout)) {
                     // The worker announces the refresh start, which begins the trace.
                     state.request_refresh();
                     unsafe {
@@ -314,14 +330,14 @@ unsafe extern "system" fn dashboard_proc(
                     }
                 } else if point_in_rect(x, y, metrics.theme_rect(layout)) {
                     if let Err(error) = state.toggle_tray_theme() {
-                        crate::show_error(&error);
+                        state.report_error(&error);
                     }
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 } else if point_in_rect(x, y, metrics.sources_rect(layout)) {
                     if let Err(error) = show_sources_menu(hwnd, state) {
-                        crate::show_error(&error);
+                        state.report_error(&error);
                     }
                 } else if point_in_rect(x, y, metrics.startup_rect(layout)) {
                     let enabled = !state.start_with_windows.load(Ordering::Relaxed);
@@ -348,7 +364,7 @@ unsafe extern "system" fn dashboard_proc(
                     .then_some(snapshot.error)
                     .flatten()
                 }) {
-                    crate::show_error(&error);
+                    state.report_error(&error);
                 } else if point_in_rect(x, y, metrics.exit_rect(layout))
                     && let Some(tray) = state.tray_window()
                 {
@@ -984,6 +1000,24 @@ fn render_dashboard(dc: HDC, client: RECT, hwnd: HWND, state: &SharedState) -> b
         layout,
     );
 
+    if let Some(notice) = state.notice() {
+        fill_round_rect(
+            dc,
+            layout.rect(CONTENT_LEFT, 58, CONTENT_RIGHT, 120),
+            layout.px(8),
+            layout.colors().card,
+        );
+        draw_text(
+            dc,
+            layout,
+            layout.rect(CARD_LEFT, 65, CARD_RIGHT, 116),
+            &notice,
+            Font::regular(12),
+            layout.colors().text,
+            DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS,
+        );
+    }
+
     let mut cursor = PulseCursor {
         clock: window_state(hwnd).and_then(|window| window.animation.borrow().frame()),
         next_bar: 0,
@@ -1121,6 +1155,27 @@ fn paint_provider(
             }
             CardRow::Models(windows) => paint_model_pills(dc, colors, windows, row_top, layout),
             CardRow::ExtraUsage(budget) => paint_extra_usage(dc, budget, row_top, layout),
+            CardRow::Resets => {
+                let label = match snapshot.reset_credits.as_ref() {
+                    Some(credits) if snapshot.error.is_none() => {
+                        format!("Reset ×{}", credits.available_count)
+                    }
+                    _ => "Reset".into(),
+                };
+                draw_text(
+                    dc,
+                    layout,
+                    reset_rect(layout, row_top),
+                    &label,
+                    Font::regular(11),
+                    if resets::is_open() {
+                        layout.colors().off_text
+                    } else {
+                        layout.colors().dim_text
+                    },
+                    DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+            }
             CardRow::Message(error) => {
                 let message = error
                     .map(error_summary)
@@ -1414,6 +1469,21 @@ fn copy_wide_fixed<const N: usize>(value: &str, target: &mut [u16; N]) {
     for (destination, source) in target.iter_mut().zip(value.encode_utf16().chain(Some(0))) {
         *destination = source;
     }
+}
+
+fn reset_rect(layout: Layout, row_top: i32) -> RECT {
+    layout.rect(
+        CARD_LEFT,
+        row_top,
+        CARD_LEFT + 100,
+        row_top + RESET_ROW_HEIGHT,
+    )
+}
+
+/// Opens a standalone visual preview without starting providers or redeeming credits.
+pub fn preview_resets() -> Result<(), String> {
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.ok();
+    resets::preview()
 }
 
 #[cfg(test)]

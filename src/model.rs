@@ -149,12 +149,42 @@ impl ExtraUsageBudget {
 }
 
 #[derive(Clone, Debug)]
+pub struct ResetCredit {
+    pub id: String,
+    pub title: String,
+    pub expires_at: Option<i64>,
+    pub expiry_known: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResetCredits {
+    pub available_count: u64,
+    /// None means the service supplied only a count. Rows may be capped.
+    pub credits: Option<Vec<ResetCredit>>,
+}
+
+impl ResetCredits {
+    pub fn choices(&self, now: i64) -> Vec<ResetCredit> {
+        let mut credits: Vec<_> = self
+            .credits
+            .iter()
+            .flatten()
+            .filter(|credit| credit.expires_at.is_none_or(|expiry| expiry > now))
+            .cloned()
+            .collect();
+        credits.sort_by_key(|credit| credit.expires_at.unwrap_or(i64::MAX));
+        credits
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ProviderSnapshot {
     pub provider: Provider,
     pub session: Option<UsageWindow>,
     pub weekly: Option<UsageWindow>,
     pub model_windows: Vec<UsageWindow>,
     pub extra_usage: Option<ExtraUsageBudget>,
+    pub reset_credits: Option<ResetCredits>,
     pub last_updated_unix: Option<i64>,
     pub from_session_history: bool,
     pub error: Option<String>,
@@ -168,6 +198,7 @@ impl ProviderSnapshot {
             weekly: None,
             model_windows: Vec::new(),
             extra_usage: None,
+            reset_credits: None,
             last_updated_unix: None,
             from_session_history: false,
             error: None,

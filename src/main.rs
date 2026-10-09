@@ -25,6 +25,12 @@ use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::w;
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--preview-resets") {
+        if let Err(error) = ui::preview_resets() {
+            show_error(&error);
+        }
+        return;
+    }
     let mutex = unsafe { CreateMutexW(None, false, w!("Local\\QuotaTray.SingleInstance")) };
     let Ok(mutex) = mutex else {
         return;
