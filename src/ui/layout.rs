@@ -140,12 +140,10 @@ mod tests {
         for history in [false, true] {
             snapshot.from_session_history = history;
             let layout = CardLayout::new(&snapshot);
-            assert!(
-                layout
-                    .rows
-                    .iter()
-                    .any(|row| matches!(row.content, CardRow::Message(None)))
-            );
+            assert!(matches!(
+                layout.rows.last().unwrap().content,
+                CardRow::Message(None)
+            ));
         }
     }
 }

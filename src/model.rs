@@ -152,7 +152,6 @@ impl ExtraUsageBudget {
 pub struct ResetCredit {
     pub id: String,
     pub title: String,
-    pub description: String,
     pub expires_at: Option<i64>,
     pub expiry_known: bool,
 }

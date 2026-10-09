@@ -303,14 +303,7 @@ unsafe extern "system" fn dashboard_proc(
                             && point_in_rect(
                                 x,
                                 y,
-                                layout.rect(
-                                    CARD_LEFT,
-                                    metrics.provider_top(Provider::Codex) + row.top,
-                                    CARD_LEFT + 100,
-                                    metrics.provider_top(Provider::Codex)
-                                        + row.top
-                                        + RESET_ROW_HEIGHT,
-                                ),
+                                reset_rect(layout, metrics.provider_top(Provider::Codex) + row.top),
                             )
                     });
                 if reset_hit {
@@ -1172,12 +1165,7 @@ fn paint_provider(
                 draw_text(
                     dc,
                     layout,
-                    layout.rect(
-                        CARD_LEFT,
-                        row_top,
-                        CARD_LEFT + 100,
-                        row_top + RESET_ROW_HEIGHT,
-                    ),
+                    reset_rect(layout, row_top),
                     &label,
                     Font::regular(11),
                     if resets::is_open() {
@@ -1481,6 +1469,15 @@ fn copy_wide_fixed<const N: usize>(value: &str, target: &mut [u16; N]) {
     for (destination, source) in target.iter_mut().zip(value.encode_utf16().chain(Some(0))) {
         *destination = source;
     }
+}
+
+fn reset_rect(layout: Layout, row_top: i32) -> RECT {
+    layout.rect(
+        CARD_LEFT,
+        row_top,
+        CARD_LEFT + 100,
+        row_top + RESET_ROW_HEIGHT,
+    )
 }
 
 /// Opens a standalone visual preview without starting providers or redeeming credits.

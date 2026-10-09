@@ -18,7 +18,7 @@ use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::app::{SharedState, WM_USAGE_UPDATED};
+use crate::app::SharedState;
 use crate::model::{Provider, ResetCredit, now_unix};
 use crate::providers::codex::{ResetOutcome, ResetSession};
 use crate::settings::Settings;
@@ -36,29 +36,25 @@ pub(super) fn open(state: Arc<SharedState>) {
         return;
     }
     state.clear_notice();
-    notify(&state);
     let worker_state = state.clone();
     if std::thread::Builder::new()
         .name("codex-reset-confirmation".into())
         .spawn(move || {
             let result = run(&worker_state);
-            if let Err(error) = result {
-                worker_state.report_error(&error);
-            }
             OPEN.store(false, Ordering::Relaxed);
-            notify(&worker_state);
+            match result {
+                Ok(()) => worker_state.notify_ui(),
+                Err(error) => {
+                    worker_state.report_error(&error);
+                    // The dialog hid the dashboard, so the notice alone would go unseen.
+                    let _ = confirm(&error, None, false, worker_state.tray_theme(), false);
+                }
+            }
         })
         .is_err()
     {
         OPEN.store(false, Ordering::Relaxed);
         state.report_error("Could not open the reset confirmation.");
-        notify(&state);
-    }
-}
-
-fn notify(state: &SharedState) {
-    if let Some(hwnd) = state.tray_window() {
-        unsafe { PostMessageW(Some(hwnd), WM_USAGE_UPDATED, WPARAM(0), LPARAM(0)) }.ok();
     }
 }
 
@@ -82,22 +78,20 @@ fn run(state: &SharedState) -> Result<(), String> {
     let first = choices.first().cloned();
     let auto = credits.credits.is_none() || choices.len() < credits.available_count as usize;
     let selection = first.as_ref().map(|credit| credit.id.clone());
-    let mut content = format!(
-        "{} · {}\r\n",
+    let detail = match &first {
+        Some(credit) => format!(
+            "{} · {}",
+            credit.title,
+            expiry_label(credit.expires_at, credit.expiry_known, now_unix())
+        ),
+        None if auto => "Codex will use the next available reset.".into(),
+        None => "No unexpired resets are available.".into(),
+    };
+    let content = format!(
+        "{} · {}\r\n{detail}",
         session.account_label(),
         session.source.label()
     );
-    if let Some(credit) = &first {
-        content.push_str(&format!(
-            "{} · {}\r\n",
-            credit.title,
-            expiry_label(credit.expires_at, credit.expiry_known, now_unix())
-        ));
-    } else if auto {
-        content.push_str("Codex will use the next available reset.\r\n");
-    } else {
-        content.push_str("No unexpired resets are available.\r\n");
-    }
     if !confirm(&content, first, auto, state.tray_theme(), false)? {
         return Ok(());
     }
@@ -124,15 +118,16 @@ pub(super) fn preview() -> Result<(), String> {
     let credit = ResetCredit {
         id: "preview-only".into(),
         title: "Sample reset".into(),
-        description: "Preview only".into(),
         expires_at: Some(now_unix() + 2 * 86400),
         expiry_known: true,
     };
-    let content = format!(
-        "Preview · sample reset\r\n{} · Applying disabled.",
-        credit.description
-    );
-    confirm(&content, Some(credit), false, theme, true)?;
+    confirm(
+        "Preview · sample reset\r\nPreview only · Applying disabled.",
+        Some(credit),
+        false,
+        theme,
+        true,
+    )?;
     Ok(())
 }
 
@@ -221,9 +216,6 @@ fn confirm(
                 DispatchMessageW(&msg);
             }
         }
-        if IsWindow(Some(hwnd)).as_bool() {
-            DestroyWindow(hwnd).ok();
-        }
     }
     Ok(data.confirmed)
 }
@@ -237,10 +229,8 @@ unsafe fn create_confirmation(content: &str, data: &mut Confirmation) -> Result<
             hInstance: instance.into(),
             lpszClassName: CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-
             ..Default::default()
         };
-        // The class remains registered for subsequent confirmation threads.
         RegisterClassW(&class);
         let layout = data.style.layout;
         let px = |v| layout.px(v);
@@ -320,7 +310,11 @@ unsafe fn create_confirmation(content: &str, data: &mut Confirmation) -> Result<
             };
             control(
                 w!("STATIC"),
-                "Apply reset?",
+                if data.credit.is_some() || data.auto {
+                    "Apply reset?"
+                } else {
+                    "Codex reset"
+                },
                 WINDOW_STYLE::default(),
                 0,
                 [14, 12, 316, 18],
@@ -369,8 +363,7 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Confirmation;
-        let data = pointer.as_ref();
+        let data = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Confirmation).as_mut();
         match msg {
             DM_GETDEFID => LRESULT(IDNO.0 as isize | ((DC_HASDEFID as isize) << 16)),
             WM_ERASEBKGND => {
@@ -424,13 +417,9 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                         }
                         return LRESULT(0);
                     }
-                    (*pointer).confirmed = true;
+                    data.confirmed = true;
                     DestroyWindow(hwnd).ok();
                 }
-                LRESULT(0)
-            }
-            WM_CLOSE => {
-                DestroyWindow(hwnd).ok();
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -560,7 +549,6 @@ mod tests {
                     credit: credit.then(|| ResetCredit {
                         id: "first".into(),
                         title: "First reset".into(),
-                        description: "Test reset".into(),
                         expires_at: Some(now_unix() + 3600),
                         expiry_known: true,
                     }),
@@ -613,7 +601,6 @@ mod tests {
                 credit: Some(ResetCredit {
                     id: "expired".into(),
                     title: "Expired reset".into(),
-                    description: "Test reset".into(),
                     expires_at: Some(now_unix() - 1),
                     expiry_known: true,
                 }),

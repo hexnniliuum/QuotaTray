@@ -158,13 +158,7 @@ impl ResetSession {
         }
         let response = self.server.request("account/rateLimitResetCredit/consume", params)
             .map_err(|_| "The reset result could not be confirmed. Check Codex usage before trying another reset.".to_string())?;
-        let outcome = reset_outcome(&response)?;
-        // The consume response does not contain the resulting usage windows.
-        let refreshed = self.server.request("account/rateLimits/read", json!({}));
-        if let Ok(snapshot) = refreshed.and_then(|value| parse_app_server_response(&value)) {
-            self.snapshot = snapshot;
-        }
-        Ok(outcome)
+        reset_outcome(&response)
     }
 }
 
@@ -329,11 +323,6 @@ fn parse_reset_credits(result: &Value) -> Option<ResetCredits> {
                             .get("title")
                             .and_then(Value::as_str)
                             .unwrap_or("Rate-limit reset")
-                            .to_string(),
-                        description: row
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Reset an eligible Codex usage window.")
                             .to_string(),
                         expires_at: row.get("expiresAt").and_then(Value::as_i64),
                         expiry_known: row
@@ -598,10 +587,6 @@ while ($line = [Console]::ReadLine()) {
                 .consume(Some("selected"), "stable-test-key")
                 .unwrap(),
             ResetOutcome::Applied
-        );
-        assert_eq!(
-            session.snapshot.session.as_ref().unwrap().used_percent,
-            12.0
         );
         session.account = json!({"type":"chatgpt", "email":"changed@example.invalid"});
         assert!(

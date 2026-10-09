@@ -243,7 +243,7 @@ impl SharedState {
         self.notify_ui();
     }
 
-    fn notify_ui(&self) {
+    pub fn notify_ui(&self) {
         if let Some(hwnd) = self.tray_window() {
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_USAGE_UPDATED, WPARAM(0), LPARAM(0));
