@@ -313,14 +313,25 @@ pub fn try_sources<T>(
     source: Source,
     mut read: impl FnMut(Source) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut errors = Vec::new();
+    let mut errors: Vec<(Source, String)> = Vec::new();
     for &candidate in source.candidates() {
         match read(candidate) {
             Ok(value) => return Ok(value),
-            Err(error) => errors.push(format!("{}: {error}", candidate.label())),
+            Err(error) => errors.push((candidate, error)),
         }
     }
-    Err(errors.join(" "))
+    // Environments that fail the same way, e.g. while offline, report it once.
+    if let [(_, first), rest @ ..] = errors.as_slice()
+        && !rest.is_empty()
+        && rest.iter().all(|(_, error)| error == first)
+    {
+        return Err(first.clone());
+    }
+    Err(errors
+        .iter()
+        .map(|(candidate, error)| format!("{}: {error}", candidate.label()))
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 #[cfg(test)]
@@ -424,6 +435,14 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(calls, [Source::Wsl]);
+    }
+
+    #[test]
+    fn auto_reports_a_shared_failure_once() {
+        let result: Result<(), _> = try_sources(Source::Auto, |_| Err("Offline".into()));
+        assert_eq!(result, Err("Offline".into()));
+        let result: Result<(), _> = try_sources(Source::Auto, |source| Err(source.label().into()));
+        assert_eq!(result, Err("WSL: WSL Windows: Windows".into()));
     }
 
     #[test]

@@ -13,6 +13,8 @@ use crate::{diagnostics, providers, service_status, visibility};
 
 pub const WM_USAGE_UPDATED: u32 = 0x8001;
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How long a failed usage refresh stays on its card unless a success replaces it first.
+const ERROR_DISPLAY: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 pub enum RefreshCommand {
@@ -36,6 +38,8 @@ pub struct SharedState {
     /// Counts refreshes as they start, so the UI can tell a new one from the
     /// one it already animated even when update messages coalesce.
     pub refresh_generation: AtomicU64,
+    /// Counts usage failures per provider so a timer hides only its own error.
+    error_serials: [AtomicU64; Provider::COUNT],
 }
 
 impl SharedState {
@@ -60,6 +64,7 @@ impl SharedState {
             visible_providers: AtomicU8::new(visibility::load()),
             icon_handles: Mutex::new([None; Provider::COUNT]),
             refresh_generation: AtomicU64::new(0),
+            error_serials: std::array::from_fn(|_| AtomicU64::new(0)),
         });
         (state, refresh_rx)
     }
@@ -157,7 +162,11 @@ impl SharedState {
         true
     }
 
-    fn refresh_usage(&self, provider: Provider, previous_config: &mut Option<ProviderSettings>) {
+    fn refresh_usage(
+        self: &Arc<Self>,
+        provider: Provider,
+        previous_config: &mut Option<ProviderSettings>,
+    ) {
         diagnostics::event("INFO", &format!("refreshing {} usage", provider.name()));
         let result = self.read_usage(provider, previous_config);
         let mut snapshots = self.snapshots.lock().unwrap();
@@ -177,10 +186,25 @@ impl SharedState {
                     );
                 }
                 target.record_error(error);
+                self.hide_error_later(provider);
             }
         }
         drop(snapshots);
         self.notify_ui();
+    }
+
+    fn hide_error_later(self: &Arc<Self>, provider: Provider) {
+        let serial = self.error_serials[provider.index()].fetch_add(1, Ordering::Relaxed) + 1;
+        let state = Arc::clone(self);
+        thread::spawn(move || {
+            thread::sleep(ERROR_DISPLAY);
+            let mut snapshots = state.snapshots.lock().unwrap();
+            if state.error_serials[provider.index()].load(Ordering::Relaxed) == serial {
+                snapshots[provider.index()].error_visible = false;
+                drop(snapshots);
+                state.notify_ui();
+            }
+        });
     }
 
     fn read_usage(

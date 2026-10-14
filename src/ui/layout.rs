@@ -1,8 +1,9 @@
 use crate::model::{ExtraUsageBudget, Provider, ProviderSnapshot, UsageWindow};
 
 use super::{
-    CARD_GAP, CARD_HEADER_HEIGHT, CARD_PAD_BOTTOM, CARD_PAD_TOP, EXTRA_USAGE_ROW_HEIGHT,
-    HISTORY_ROW_HEIGHT, MESSAGE_ROW_HEIGHT, MODEL_ROW_HEIGHT, RESET_ROW_HEIGHT, WINDOW_ROW_HEIGHT,
+    CARD_GAP, CARD_HEADER_HEIGHT, CARD_PAD_BOTTOM, CARD_PAD_TOP, ERROR_ROW_HEIGHT,
+    EXTRA_USAGE_ROW_HEIGHT, HISTORY_ROW_HEIGHT, MESSAGE_ROW_HEIGHT, MODEL_ROW_HEIGHT,
+    RESET_ROW_HEIGHT, WINDOW_ROW_HEIGHT,
 };
 
 pub(super) enum CardRow<'a> {
@@ -11,7 +12,8 @@ pub(super) enum CardRow<'a> {
     Models(&'a [UsageWindow]),
     ExtraUsage(&'a ExtraUsageBudget),
     Resets,
-    Message(Option<&'a str>),
+    Message,
+    Error(&'a str),
 }
 
 impl CardRow<'_> {
@@ -22,7 +24,8 @@ impl CardRow<'_> {
             Self::Models(_) => MODEL_ROW_HEIGHT,
             Self::ExtraUsage(_) => EXTRA_USAGE_ROW_HEIGHT,
             Self::Resets => RESET_ROW_HEIGHT,
-            Self::Message(_) => MESSAGE_ROW_HEIGHT,
+            Self::Message => MESSAGE_ROW_HEIGHT,
+            Self::Error(_) => ERROR_ROW_HEIGHT,
         }
     }
 }
@@ -64,8 +67,10 @@ impl<'a> CardLayout<'a> {
         if let Some(budget) = snapshot.extra_usage.as_ref() {
             rows.push(CardRow::ExtraUsage(budget));
         }
-        if rows.len() == usage_start || snapshot.error.is_some() {
-            rows.push(CardRow::Message(snapshot.error.as_deref()));
+        if let Some(error) = snapshot.visible_error() {
+            rows.push(CardRow::Error(error));
+        } else if rows.len() == usage_start {
+            rows.push(CardRow::Message);
         }
         let mut top = CARD_PAD_TOP + CARD_HEADER_HEIGHT;
         let rows = rows
@@ -101,7 +106,7 @@ mod tests {
             .model_windows
             .push(UsageWindow::new("Model", 30.0, None));
         snapshot.extra_usage = Some(ExtraUsageBudget::new(100, Some(200), "USD", 2));
-        snapshot.error = Some("Refresh failed".into());
+        snapshot.record_error("Refresh failed".into());
         let layout = CardLayout::new(&snapshot);
         assert!(matches!(layout.rows.as_slice(), [
             PositionedRow { content: CardRow::Resets, .. },
@@ -110,13 +115,13 @@ mod tests {
             PositionedRow { content: CardRow::Window(weekly), .. },
             PositionedRow { content: CardRow::Models(_), .. },
             PositionedRow { content: CardRow::ExtraUsage(_), .. },
-            PositionedRow { content: CardRow::Message(Some("Refresh failed")), .. },
+            PositionedRow { content: CardRow::Error("Refresh failed"), .. },
         ] if session.label == "Session" && weekly.label == "Weekly"));
         assert_eq!(
             layout.rows.iter().map(|row| row.top).collect::<Vec<_>>(),
             [42, 62, 82, 128, 174, 204, 234]
         );
-        assert_eq!(layout.height, 306);
+        assert_eq!(layout.height, 272);
     }
 
     #[test]
@@ -142,8 +147,18 @@ mod tests {
             let layout = CardLayout::new(&snapshot);
             assert!(matches!(
                 layout.rows.last().unwrap().content,
-                CardRow::Message(None)
+                CardRow::Message
             ));
         }
+        snapshot.record_error("Offline".into());
+        assert!(matches!(
+            CardLayout::new(&snapshot).rows.last().unwrap().content,
+            CardRow::Error("Offline")
+        ));
+        snapshot.error_visible = false;
+        assert!(matches!(
+            CardLayout::new(&snapshot).rows.last().unwrap().content,
+            CardRow::Message
+        ));
     }
 }

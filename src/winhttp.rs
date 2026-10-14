@@ -224,9 +224,14 @@ fn checked_bool(result: i32, operation: &str) -> Result<(), String> {
     }
 }
 
+// The system message table lacks WinHTTP codes, so common ones get short names.
 fn last_error(operation: &str) -> String {
-    format!(
-        "Failed while {operation}: {}",
-        std::io::Error::last_os_error()
-    )
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(12002) => "Request timed out".to_string(),
+        Some(12007) => "Server not found (offline?)".to_string(),
+        Some(12029 | 12030) => "Connection failed".to_string(),
+        Some(code @ 12000..=12999) => format!("Network error {code} while {operation}"),
+        _ => format!("Failed while {operation}: {error}"),
+    }
 }

@@ -62,6 +62,7 @@ const MODEL_ROW_HEIGHT: i32 = 30;
 const EXTRA_USAGE_ROW_HEIGHT: i32 = 30;
 const RESET_ROW_HEIGHT: i32 = 20;
 const MESSAGE_ROW_HEIGHT: i32 = 54;
+const ERROR_ROW_HEIGHT: i32 = 20;
 const FOOTER_HEIGHT: i32 = 40;
 /// Right edge of the usage bars; the percentage and reset columns follow.
 const BARS_RIGHT: i32 = 224;
@@ -128,18 +129,6 @@ impl DashboardMetrics {
             self.footer_top + 28,
         )
     }
-}
-
-fn error_summary(error: &str) -> String {
-    let prefix: String = error.chars().take(75).collect();
-    format!(
-        "{prefix}{} Click for details.",
-        if error.chars().count() > 75 {
-            "..."
-        } else {
-            ""
-        }
-    )
 }
 
 pub fn run(state: Arc<SharedState>) -> windows::core::Result<()> {
@@ -347,24 +336,6 @@ unsafe extern "system" fn dashboard_proc(
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     };
-                } else if let Some(error) = Provider::ALL.into_iter().find_map(|provider| {
-                    let snapshot = state.snapshot(provider);
-                    let top = metrics.provider_top(provider);
-                    (state.is_provider_visible(provider)
-                        && point_in_rect(
-                            x,
-                            y,
-                            layout.rect(
-                                CONTENT_LEFT,
-                                top,
-                                CONTENT_RIGHT,
-                                top + CardLayout::new(&snapshot).height - CARD_GAP,
-                            ),
-                        ))
-                    .then_some(snapshot.error)
-                    .flatten()
-                }) {
-                    state.report_error(&error);
                 } else if point_in_rect(x, y, metrics.exit_rect(layout))
                     && let Some(tray) = state.tray_window()
                 {
@@ -1127,11 +1098,7 @@ fn paint_provider(
             dc,
             layout,
             header_rect(250, CARD_RIGHT),
-            &if snapshot.error.is_some() {
-                "Refresh failed".into()
-            } else {
-                snapshot.freshness_label(now)
-            },
+            &snapshot.freshness_label(now),
             Font::regular(11),
             layout.colors().dim_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
@@ -1176,25 +1143,29 @@ fn paint_provider(
                     DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
             }
-            CardRow::Message(error) => {
-                let message = error
-                    .map(error_summary)
-                    .unwrap_or_else(|| "Waiting for usage...".into());
-                draw_text(
-                    dc,
-                    layout,
-                    layout.rect(
-                        CARD_LEFT,
-                        row_top + 4,
-                        CARD_RIGHT,
-                        row_top + MESSAGE_ROW_HEIGHT,
-                    ),
-                    &message,
-                    Font::regular(12),
-                    layout.colors().muted_text,
-                    DT_LEFT | DT_WORDBREAK,
-                );
-            }
+            CardRow::Message => draw_text(
+                dc,
+                layout,
+                layout.rect(
+                    CARD_LEFT,
+                    row_top + 4,
+                    CARD_RIGHT,
+                    row_top + MESSAGE_ROW_HEIGHT,
+                ),
+                "Waiting for usage...",
+                Font::regular(12),
+                layout.colors().muted_text,
+                DT_LEFT | DT_WORDBREAK,
+            ),
+            CardRow::Error(error) => draw_text(
+                dc,
+                layout,
+                layout.rect(CARD_LEFT, row_top, CARD_RIGHT, row_top + ERROR_ROW_HEIGHT),
+                error,
+                Font::regular(11),
+                layout.colors().muted_text,
+                DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS,
+            ),
         }
     }
 }
@@ -1495,21 +1466,18 @@ mod tests {
     }
 
     #[test]
-    fn long_errors_keep_the_card_bounded_and_offer_full_details() {
+    fn long_errors_take_one_row() {
         let mut snapshot = ProviderSnapshot::empty(Provider::Claude);
-        snapshot.error = Some("Missing login. ".repeat(100));
+        snapshot.record_error("Missing login. ".repeat(100));
         let card_chrome = CARD_PAD_TOP + CARD_HEADER_HEIGHT + CARD_PAD_BOTTOM + CARD_GAP;
         assert_eq!(
             CardLayout::new(&snapshot).height,
-            card_chrome + MESSAGE_ROW_HEIGHT
+            card_chrome + ERROR_ROW_HEIGHT
         );
-        let summary = error_summary(snapshot.error.as_ref().unwrap());
-        assert!(summary.len() < 110);
-        assert!(summary.ends_with("Click for details."));
         snapshot.session = Some(UsageWindow::new("Session", 10.0, None));
         assert_eq!(
             CardLayout::new(&snapshot).height,
-            card_chrome + WINDOW_ROW_HEIGHT + MESSAGE_ROW_HEIGHT
+            card_chrome + WINDOW_ROW_HEIGHT + ERROR_ROW_HEIGHT
         );
     }
 
