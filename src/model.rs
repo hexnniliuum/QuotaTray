@@ -187,7 +187,10 @@ pub struct ProviderSnapshot {
     pub reset_credits: Option<ResetCredits>,
     pub last_updated_unix: Option<i64>,
     pub from_session_history: bool,
+    /// The last refresh failure, kept until a refresh succeeds.
     pub error: Option<String>,
+    /// Whether the card still shows `error`; it hides shortly after the failure.
+    pub error_visible: bool,
 }
 
 impl ProviderSnapshot {
@@ -202,6 +205,7 @@ impl ProviderSnapshot {
             last_updated_unix: None,
             from_session_history: false,
             error: None,
+            error_visible: false,
         }
     }
 
@@ -218,6 +222,11 @@ impl ProviderSnapshot {
 
     pub fn record_error(&mut self, message: String) {
         self.error = Some(message);
+        self.error_visible = true;
+    }
+
+    pub fn visible_error(&self) -> Option<&str> {
+        self.error.as_deref().filter(|_| self.error_visible)
     }
 
     pub fn freshness_label(&self, now_unix: i64) -> String {
